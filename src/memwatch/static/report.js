@@ -1,16 +1,12 @@
 "use strict";
-(function () {
-  const TOKEN = new URLSearchParams(location.search).get("t") || "";
-  const HEADERS = { "X-Memwatch-Token": TOKEN, "Content-Type": "application/json" };
-  const SVGNS = "http://www.w3.org/2000/svg";
+// Pure view helpers (no DOM): exported under Node for tests, used by the page below.
+const View = (function () {
+  const SOURCE_LABELS = {
+    run: "Run key", startup_folder: "Startup folder", packaged: "Store app startup task",
+    task: "Scheduled task at logon", service: "Service (Automatic)",
+  };
+  const WINDOWS_TASK = "Windows system task";
 
-  let report = null;
-  let sortDesc = true;
-  const results = {};   // app_key -> {status, message}
-  const forceable = new Set(); // app_keys that returned still_open
-  const busy = new Set();
-
-  // ---- formatting -------------------------------------------------------
   function fmtSize(b) {
     if (b == null) return "unknown";
     const mb = b / 1048576;
@@ -31,6 +27,80 @@
     if (d > 0) return d + (d === 1 ? " day " : " days ") + h + " h";
     return h + " h " + Math.floor((s % 3600) / 60) + " min";
   }
+  function fmtClock(ts) {
+    const d = new Date(ts * 1000);
+    return String(d.getHours()).padStart(2, "0") + ":" + String(d.getMinutes()).padStart(2, "0");
+  }
+
+  // "Data as of HH:MM", plus a warning when the logger has stopped writing.
+  function freshness(report) {
+    if (report.data_ts == null) return null;
+    const at = fmtClock(report.data_ts);
+    return {
+      text: "Data as of " + at,
+      warning: report.stale
+        ? "The memwatch logger hasn't recorded anything since " + at + " \u2014 run `memwatch status`."
+        : null,
+    };
+  }
+
+  function sizeLine(s) {
+    return "now " + fmtSize(s.private_bytes) + " \u00b7 typical " + fmtSize(s.typical_private) +
+      " \u00b7 working set " + fmtSize(s.working_set);
+  }
+
+  function isWindowsTask(e) {
+    return e.source === "task" && (e.location || "").toLowerCase().startsWith("\\microsoft\\windows\\");
+  }
+  function isActionable(e) { return e.enabled && e.can_disable && !isWindowsTask(e); }
+  function actionableEntries(entries) { return (entries || []).filter(isActionable); }
+
+  // One read-only line per startup entry.
+  function entryView(e) {
+    const winTask = isWindowsTask(e);
+    const readOnly = winTask || !e.can_disable;
+    return {
+      text: e.name + " \u2014 " + (SOURCE_LABELS[e.source] || e.source),
+      readOnly: readOnly,
+      note: winTask ? WINDOWS_TASK : (readOnly ? (e.note || "memwatch cannot switch this off") : null),
+      off: !e.enabled,
+    };
+  }
+
+  function disableConfirm(label, entries, mode) {
+    const names = actionableEntries(entries).map(
+      (e) => "\u2022 " + e.name + " (" + (SOURCE_LABELS[e.source] || e.source) + ")");
+    const head = "Stop " + label + " starting with Windows" +
+      (mode ? " (services set to " + (mode === "manual" ? "Manual" : "Disabled") + ")?" : "?");
+    return head + "\n\nThese will be switched off:\n" + names.join("\n") +
+      "\n\nYou can undo this from the Undo section.";
+  }
+
+  // Read-only list of what makes up the app (per-part actions are not offered).
+  function partsList(s) {
+    const out = [];
+    if (s.n_procs) out.push(s.n_procs + (s.n_procs === 1 ? " process" : " processes"));
+    for (const name of s.services || []) out.push("Service: " + name);
+    return out;
+  }
+
+  return { fmtSize, fmtAgo, fmtUptime, fmtClock, freshness, sizeLine, isWindowsTask,
+           actionableEntries, entryView, disableConfirm, partsList };
+})();
+
+if (typeof module !== "undefined" && module.exports) {
+  module.exports = View;
+} else (function () {
+  const TOKEN = new URLSearchParams(location.search).get("t") || "";
+  const HEADERS = { "X-Memwatch-Token": TOKEN, "Content-Type": "application/json" };
+  const SVGNS = "http://www.w3.org/2000/svg";
+  const { fmtSize, fmtAgo, fmtUptime } = View;
+
+  let report = null;
+  let sortDesc = true;
+  const results = {};   // app_key -> {status, message}
+  const forceable = new Set(); // app_keys that returned still_open
+  const busy = new Set();
 
   // ---- dom helpers ------------------------------------------------------
   function el(tag, props, ...kids) {
@@ -117,6 +187,11 @@
     const body = $("pressure-body");
     clear(body);
     const s = report.system;
+    const fresh = View.freshness(report);
+    if (fresh) {
+      body.append(el("div", { class: "sub asof", text: fresh.text }));
+      if (fresh.warning) body.append(el("div", { class: "note stale", role: "alert", text: fresh.warning }));
+    }
     if (!s) {
       body.append(el("div", { class: "muted", text: "No samples recorded yet. Is the memwatch logger running?" }));
     } else {
@@ -139,6 +214,7 @@
     const name = el("span", { class: "name", text: s.label });
     if (s.limited) name.append(el("span", { class: "tag", text: "limited data" }));
     card.append(el("div", { class: "sug-head" }, name, el("span", { class: "size", text: fmtSize(s.private_bytes) })));
+    card.append(el("div", { class: "sub", text: View.sizeLine(s) }));
     card.append(el("div", { class: "sub", text: "Last used " + fmtAgo(s.last_used, report.now) }));
     if (s.reasons.length) {
       const ul = el("ul", { class: "reasons" });
@@ -166,7 +242,8 @@
         },
       }));
     }
-    if (s.startup && s.startup.length) {
+    const toSwitch = View.actionableEntries(s.startup);
+    if (toSwitch.length) {
       const grp = el("span", { class: "group" });
       let sel = null;
       if (s.service_modes && s.service_modes.length) {
@@ -178,17 +255,37 @@
         class: "btn danger", type: "button", disabled: isBusy, text: "Stop starting with Windows",
         onclick: () => {
           const mode = sel ? sel.value : null;
-          const what = mode ? "Set " + s.label + " startup to " + mode + "?" : "Stop " + s.label + " starting with Windows?";
-          if (confirm(what + " You can undo this from the Undo section."))
+          if (confirm(View.disableConfirm(s.label, s.startup, mode)))
             act(s.app_key, { action: "disable_startup", app_key: s.app_key, mode: mode });
         },
       }));
       actions.append(grp);
     }
     card.append(actions);
+    if (s.startup && s.startup.length) card.append(startupList(s.startup));
+    const parts = View.partsList(s);
+    if (parts.length) {
+      const ul = el("ul", { class: "parts" });
+      for (const p of parts) ul.append(el("li", { text: p }));
+      card.append(el("details", { class: "parts" },
+        el("summary", { text: "Parts (" + parts.length + ")" }), ul));
+    }
     const res = results[s.app_key];
     if (res) card.append(resultNode(res));
     return card;
+  }
+
+  function startupList(entries) {
+    const ul = el("ul", { class: "startup" });
+    for (const e of entries) {
+      const v = View.entryView(e);
+      const li = el("li", { class: v.readOnly ? "ro" : null, text: v.text });
+      if (v.off) li.append(el("span", { class: "tag", text: "off" }));
+      if (v.note) li.append(el("span", { class: "tag ro", text: v.note }));
+      ul.append(li);
+    }
+    return el("div", { class: "startup-box" },
+      el("div", { class: "sub", text: "Starts with Windows via:" }), ul);
   }
 
   function resultNode(res) {
