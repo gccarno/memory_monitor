@@ -44,10 +44,12 @@ def setup_logging(cfg: Config) -> logging.Handler:
 
 class Logger:
     def __init__(self, cfg: Config, conn: sqlite3.Connection,
-                 clock: Callable[[], float] = time.time):
+                 clock: Callable[[], float] = time.time,
+                 sleep: Callable[[float], None] = time.sleep):
         self.cfg = cfg
         self.conn = conn
         self.clock = clock
+        self._sleep = sleep
         self._handler = setup_logging(cfg)
         self._n = 0
         self._services: dict = {}
@@ -66,14 +68,29 @@ class Logger:
         except Exception:
             log.exception("tick %d failed", n)
 
-    def _tick(self, n: int) -> None:
+    def _refresh(self, n: int) -> None:
+        """Periodic work, attempted at the start of its due tick so a later failure can't skip it."""
         cfg = self.cfg
-        ts = int(self.clock())
         if n % _SERVICES_EVERY == 0:
             try:
                 self._services = probe.services_by_pid()
             except Exception:
                 log.exception("service refresh failed")
+        if n % _STARTUP_EVERY == 0:
+            try:
+                replace_startup(self.conn, inventory(cfg))
+            except Exception:
+                log.exception("startup inventory failed")
+        if n % _PRUNE_EVERY == 0:
+            try:
+                prune(self.conn, int(self.clock()), cfg.retention_days)
+            except Exception:
+                log.exception("prune failed")
+
+    def _tick(self, n: int) -> None:
+        cfg = self.cfg
+        self._refresh(n)
+        ts = int(self.clock())
         procs = probe.snapshot_processes()
         groups = group_processes(procs, self._services, cfg)
         flags = mark_usage(
@@ -83,22 +100,17 @@ class Logger:
         system = dataclasses.replace(system, logger_ws=int(self._self.memory_info().wset))
         write_tick(self.conn, system, [(g, flags[k]) for k, g in groups.items()])
         self._prev = {(p.pid, p.create_time): (p.cpu_s or 0.0, p.io_bytes or 0) for p in procs}
-        if n % _STARTUP_EVERY == 0:
-            try:
-                replace_startup(self.conn, inventory(cfg))
-            except Exception:
-                log.exception("startup inventory failed")
-        if n % _PRUNE_EVERY == 0:
-            try:
-                prune(self.conn, ts, cfg.retention_days)
-            except Exception:
-                log.exception("prune failed")
+
+    def _delay(self) -> float:
+        interval = self.cfg.sample_interval_s
+        delay = interval - (self.clock() % interval)
+        # too close to the boundary: wait for the following one so ts values never collide
+        return delay + interval if delay < 1.0 else delay
 
     def run_forever(self) -> None:
-        interval = self.cfg.sample_interval_s
         while True:
             self.tick()
-            time.sleep(interval - (self.clock() % interval))
+            self._sleep(self._delay())
 
 
 _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
