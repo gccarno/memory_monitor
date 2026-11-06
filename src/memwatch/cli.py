@@ -136,10 +136,48 @@ def _cmd_install(args) -> int:
     return 0
 
 
+_UNDO_HOW = {
+    "run": "Task Manager > Startup apps",
+    "startup_folder": "Task Manager > Startup apps",
+    "packaged": "Task Manager > Startup apps",
+    "task": "Task Scheduler (enable the task)",
+    "service": "services.msc (set the startup type back to Automatic)",
+}
+
+
+def _outstanding_changes(data_dir: Path) -> list:
+    """memwatch startup changes that were never undone (the purge would lose their record)."""
+    path = data_dir / "memwatch.db"
+    if not path.is_file():
+        return []
+    try:
+        conn = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True)
+        try:
+            return db.list_actions(conn)
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return []
+
+
 def _cmd_uninstall(args) -> int:
     if args.root and not args.desktop:
         print("--root requires --desktop", file=sys.stderr)
         return 2
+    if args.purge and not args.force:
+        pending = _outstanding_changes(load_config().data_dir)
+        if pending:
+            print(f"memwatch: {len(pending)} startup change(s) made by memwatch are still in "
+                  "effect, and purging deletes the record needed to undo them:",
+                  file=sys.stderr)
+            for rec in pending:
+                src = rec.entry.get("source", "")
+                print(f"  - {rec.entry.get('name', rec.app_key)} ({src}): re-enable in "
+                      f"{_UNDO_HOW.get(src, 'Task Manager or services.msc')}", file=sys.stderr)
+            print("Undo them in the report's Undo section (or by hand as above), then run "
+                  "this again; or pass --force to purge anyway. Nothing was removed.",
+                  file=sys.stderr)
+            return 1
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _run_key(args.root), 0,
                             winreg.KEY_SET_VALUE) as k:
@@ -207,6 +245,8 @@ def main(argv: list[str] | None = None) -> int:
         p.add_argument("--desktop", help=argparse.SUPPRESS)  # tests only
         if name == "uninstall":
             p.add_argument("--purge", action="store_true", help="also delete the data dir")
+            p.add_argument("--force", action="store_true",
+                           help="purge even while memwatch startup changes are not undone")
         p.set_defaults(fn=fn)
     sub.add_parser("status").set_defaults(fn=_cmd_status)
     args = ap.parse_args(argv)

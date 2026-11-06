@@ -18,12 +18,18 @@ Double-click **Memory Report** on the desktop, or run `.venv\Scripts\python -m m
 
 Actions that need administrator rights (stopping some services, changing service start types) show a Windows UAC prompt for Python. Approve it only for an action you clicked.
 
+## Security note
+
+Admin actions run memwatch's own Python code (the editable install in this repo and its `.venv`) under the Windows UAC prompt for Python. Anything that can edit this folder could therefore change what runs as admin the next time you approve a prompt. Keep the folder private to your account, or for daily use install memwatch non-editable (`pip install .` into a venv outside this repo).
+
 ## Uninstall
 
 ```
 .venv\Scripts\python -m memwatch uninstall          # remove startup entry and shortcut, stop the logger
 .venv\Scripts\python -m memwatch uninstall --purge  # also delete the collected data
 ```
+
+`--purge` refuses while startup changes made by memwatch are still in effect (it would delete the record needed to undo them). It lists them and where to re-enable each one (Task Manager > Startup apps, Task Scheduler, or services.msc). Undo them in the report first, or add `--force` to purge anyway.
 
 ## Where data lives
 

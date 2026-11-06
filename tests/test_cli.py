@@ -222,3 +222,50 @@ def test_start_logger_detached_closes_handles(monkeypatch):
     assert calls[0][1].endswith('pythonw.exe" -m memwatch log')
     flags = calls[0][5]
     assert flags & cli.win32process.DETACHED_PROCESS
+
+
+def no_spawn():
+    raise AssertionError("tests must never start a real logger")
+
+
+def _data_with_action(tmp_path, monkeypatch, undone=False):
+    from memwatch.db import connect, mark_undone, record_action
+    from memwatch.models import ActionRecord
+
+    local = tmp_path / "local"
+    monkeypatch.setenv("LOCALAPPDATA", str(local))
+    c = connect(local / "memwatch" / "memwatch.db")
+    for src, name, loc in [("service", "Tobii Service", "TobiiSvc"),
+                           ("run", "Discord", r"HKCU\Discord")]:
+        i = record_action(c, ActionRecord(None, 5, "suite:x", "disable_startup",
+                                          {"source": src, "name": name, "location": loc},
+                                          {}, False))
+        if undone:
+            mark_undone(c, i)
+    c.close()
+    monkeypatch.setattr(cli, "find_loggers", lambda: [])
+    monkeypatch.setattr(cli, "start_logger_detached", no_spawn)
+    return local / "memwatch"
+
+
+def test_purge_refuses_while_startup_changes_are_outstanding(tmp_path, test_root, monkeypatch,
+                                                             capsys):
+    data = _data_with_action(tmp_path, monkeypatch)
+    assert main(["uninstall", "--purge", "--root", test_root, "--desktop", str(tmp_path)]) == 1
+    err = capsys.readouterr().err
+    assert "Tobii Service" in err and "Discord" in err and "--force" in err
+    assert "services.msc" in err and "Task Manager" in err
+    assert (data / "memwatch.db").exists()  # nothing deleted
+
+
+def test_purge_force_deletes_anyway(tmp_path, test_root, monkeypatch):
+    data = _data_with_action(tmp_path, monkeypatch)
+    assert main(["uninstall", "--purge", "--force", "--root", test_root,
+                 "--desktop", str(tmp_path)]) == 0
+    assert not data.exists()
+
+
+def test_purge_ignores_undone_changes(tmp_path, test_root, monkeypatch):
+    data = _data_with_action(tmp_path, monkeypatch, undone=True)
+    assert main(["uninstall", "--purge", "--root", test_root, "--desktop", str(tmp_path)]) == 0
+    assert not data.exists()
