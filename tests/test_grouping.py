@@ -87,3 +87,28 @@ def test_totals_and_limited(cfg):
              mkproc(11, 10, "chrome.exe", None, private_bytes=200, working_set=70, limited=True)]
     g = group_processes(procs, {}, cfg)["suite:google chrome"]
     assert (g.private_bytes, g.working_set, g.limited) == (300, 120, True)
+
+
+def test_protected_parent_is_inheritance_boundary(cfg):
+    procs = [mkproc(70, 1, "SearchHost.exe", r"C:\Windows\SystemApps\x\SearchHost.exe"),
+             mkproc(71, 70, "foo.exe", r"C:\Program Files\Foo\foo.exe")]
+    g = group_processes(procs, {}, cfg)
+    assert g["suite:foo"].pids == [(71, 1.0)]
+    assert g["protected:windows"].pids == [(70, 1.0)]
+
+
+def test_windows_path_uses_company(cfg, monkeypatch):
+    from memwatch import grouping
+    exe = r"C:\Windows\System32\DriverStore\x\svc.exe"
+    monkeypatch.setattr(grouping, "_company", lambda p: "Microsoft Corporation")
+    assert suite_from_path(exe, "svc.exe", cfg) == ("windows:svc.exe", "svc.exe", True)
+    monkeypatch.setattr(grouping, "_company", lambda p: "Realtek Semiconductor Corp.")
+    assert suite_from_path(exe, "svc.exe", cfg) == (
+        "suite:realtek semiconductor", "Realtek Semiconductor", False)
+    monkeypatch.setattr(grouping, "_company", lambda p: None)
+    assert suite_from_path(exe, "svc.exe", cfg)[2] is True
+
+
+def test_microsoft_override_flagged(cfg):
+    cfg.suite_overrides["\\foo\\"] = "Microsoft Foo"
+    assert suite_from_path(r"C:\x\foo\a.exe", "a.exe", cfg)[2] is True

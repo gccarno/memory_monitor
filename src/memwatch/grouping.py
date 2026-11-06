@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ntpath
 import re
+from functools import lru_cache
 from datetime import datetime
 
 from memwatch import probe
@@ -22,6 +23,22 @@ _WINDOWSAPPS = re.compile(r"\\windowsapps\\([^\\_]+)_", re.I)
 _MS_NEXT = re.compile(r"\\microsoft\\([^\\]+)\\", re.I)
 
 
+@lru_cache(maxsize=512)
+def _company(path: str) -> str | None:
+    """CompanyName from the exe's version info, or None when unreadable."""
+    try:
+        import win32api
+
+        lang, cp = win32api.GetFileVersionInfo(path, "\\VarFileInfo\\Translation")[0]
+        return win32api.GetFileVersionInfo(
+            path, f"\\StringFileInfo\\{lang:04x}{cp:04x}\\CompanyName") or None
+    except Exception:
+        return None
+
+
+_CORP_SUFFIX = re.compile(r"[,\s]+(inc\.?|corporation|corp\.?|co\.,? ?ltd\.?|ltd\.?)$", re.I)
+
+
 def suite_from_path(path: str | None, name: str, cfg: Config) -> tuple[str, str, bool]:
     """Map an exe path to (app_key, label, microsoft)."""
     stem = name[:-4] if name.lower().endswith(".exe") else name
@@ -30,7 +47,7 @@ def suite_from_path(path: str | None, name: str, cfg: Config) -> tuple[str, str,
     low = path.lower()
     for sub, label in cfg.suite_overrides.items():
         if sub.lower() in low:
-            return f"suite:{label.lower()}", label, False
+            return f"suite:{label.lower()}", label, label.lower().startswith("microsoft")
     m = _WINDOWSAPPS.search(path)
     if m:
         label = m.group(1)
@@ -48,6 +65,10 @@ def suite_from_path(path: str | None, name: str, cfg: Config) -> tuple[str, str,
             return f"suite:{label.lower()}", label, True
         return f"suite:{label.lower()}", label, label.lower().startswith("microsoft")
     if "\\windows\\" in low:
+        company = _company(path)
+        if company and not company.lower().startswith("microsoft"):
+            label = _CORP_SUFFIX.sub("", company.strip()) or company.strip()
+            return f"suite:{label.lower()}", label, False
         return f"windows:{name.lower()}", name, True
     return f"suite:{stem.lower()}", stem, False
 
@@ -125,7 +146,8 @@ def group_processes(
             parent = by_pid.get(p.ppid)
             if (parent is not None and parent.pid != p.pid and parent.pid not in seen
                     and parent.create_time <= p.create_time
-                    and parent.name.lower() not in shell):
+                    and parent.name.lower() not in shell
+                    and not _is_protected(parent, services, cfg)):
                 key = resolve(parent, seen | {p.pid})
             else:
                 key, label, ms = suite_from_path(p.exe, p.name, cfg)

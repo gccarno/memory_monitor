@@ -67,7 +67,8 @@ _SUITE_OVERRIDES = {
     "\\tobiiab.": "Tobii",
     "\\google\\drive": "Google Drive",
     "\\driverstore\\filerepository\\lenovo": "Lenovo Vantage",
-    "\\driverstore\\filerepository\\nv": "NVIDIA",
+    "\\driverstore\\filerepository\\nv_": "NVIDIA",
+    "\\driverstore\\filerepository\\nvlt.": "NVIDIA",
     "\\elevocinstalldriver\\": "Elevoc",
     "\\common files\\microsoft shared\\": "Microsoft Office",
 }
