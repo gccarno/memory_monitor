@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import dataclasses
 import sqlite3
+import threading
 import time
 
 import psutil
 
 from memwatch import probe, startup
 from memwatch.config import Config
-from memwatch.db import get_action, mark_undone, record_action
+from memwatch.db import get_action, mark_undone, record_action, set_startup_enabled
 from memwatch.elevate import Elevator, run_elevated
 from memwatch.elevated_runner import is_memwatch_cmdline
 from memwatch.models import ActionRecord, ActionResult, AppGroup, StartupEntry
@@ -26,6 +27,9 @@ _EXIT_WAIT_S = 5
 _LOCAL_SOURCES = ("run", "startup_folder", "packaged")
 
 _dependents = default_dependents  # module-level so tests can substitute it
+# Startup changes and undos run one at a time, so a double click sees the first
+# click's result (live state) instead of recording a second, already-off "before".
+_startup_lock = threading.Lock()
 
 
 def _elevator(elevator: Elevator | None, cfg: Config) -> Elevator:
@@ -417,20 +421,50 @@ def _undo_ops(e: StartupEntry, before: dict) -> list[dict]:
 def _record(conn, app_key: str, e: StartupEntry, before: dict) -> None:
     record_action(conn, ActionRecord(None, int(time.time()), app_key, "disable_startup",
                                      dataclasses.asdict(e), before, False))
+    set_startup_enabled(conn, e.source, e.location, False)
+
+
+def _live_enabled(e: StartupEntry, root: str) -> bool | None:
+    """Whether the entry is switched on right now, or None when that cannot be read."""
+    if e.source == "service":
+        start = _service_start(e.location)
+        return None if start is None else start in ("auto", "delayed-auto")
+    return startup.live_enabled(e, root)
+
+
+def _enabled_after_undo(e: StartupEntry, before: dict) -> bool:
+    if e.source == "service":
+        return before.get("start") in ("auto", "delayed-auto")
+    if e.source == "task":
+        return bool(before.get("enabled"))
+    if e.source == "packaged":
+        return before.get("state") in (2, 4)
+    raw = before.get("approved")
+    return startup.approved_is_enabled(bytes.fromhex(raw) if raw is not None else None)
 
 
 def disable_startup(conn: sqlite3.Connection, app_key: str, entries: list[StartupEntry],
                     mode: str | None, cfg: Config, elevator: Elevator | None = None,
                     root: str = "") -> ActionResult:
+    with _startup_lock:
+        return _disable_startup(conn, app_key, entries, mode, cfg, elevator, root)
+
+
+def _disable_startup(conn, app_key, entries, mode, cfg, elevator, root) -> ActionResult:
     notes: list[str] = []
     ok = attempted = 0
     pending: list[tuple[StartupEntry, dict, list[dict]]] = []
     for e in entries:
-        if not e.can_disable:
-            notes.append(f"{e.name}: {e.note or 'cannot be turned off here'}.")
+        windows_task = e.source == "task" and startup.is_windows_task(e.location)
+        if not e.can_disable or windows_task:
+            note = startup.WINDOWS_TASK_NOTE if windows_task else e.note
+            notes.append(f"{e.name}: {note or 'cannot be turned off here'}.")
             attempted += 1
             continue
-        if not e.enabled:
+        live = _live_enabled(e, root)  # the table may be up to 30 ticks old
+        if live is not None and live != e.enabled:
+            set_startup_enabled(conn, e.source, e.location, live)
+        if not (e.enabled if live is None else live):
             notes.append(f"{e.name} is already off.")
             continue
         attempted += 1
@@ -476,6 +510,11 @@ def disable_startup(conn: sqlite3.Connection, app_key: str, entries: list[Startu
 
 def undo(conn: sqlite3.Connection, action_id: int, cfg: Config,
          elevator: Elevator | None = None, root: str = "") -> ActionResult:
+    with _startup_lock:
+        return _undo(conn, action_id, cfg, elevator, root)
+
+
+def _undo(conn, action_id, cfg, elevator, root) -> ActionResult:
     rec = get_action(conn, action_id)
     if rec is None:
         return ActionResult("failed", "That change is not on record.")
@@ -498,4 +537,5 @@ def undo(conn: sqlite3.Connection, action_id: int, cfg: Config,
     except (OSError, ValueError, KeyError, TypeError) as ex:
         return ActionResult("failed", f"Could not undo: {ex}.")
     mark_undone(conn, action_id)
+    set_startup_enabled(conn, e.source, e.location, _enabled_after_undo(e, rec.before))
     return ActionResult("done", f"Restored {e.name} at startup.")

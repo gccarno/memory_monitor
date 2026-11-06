@@ -139,3 +139,19 @@ def test_refresh_errors_are_logged_and_swallowed(lg, monkeypatch):
     for msg in ("service refresh failed", "startup inventory failed", "prune failed"):
         assert msg in text
     assert latest_system(lg.conn) is not None  # the sample was still written
+
+
+def test_tick_records_protected_product_markers(lg, monkeypatch):
+    from conftest import mkproc
+    from memwatch.db import latest_markers
+
+    real = probe.snapshot_processes
+    fake_defender = mkproc(999_991, 4, "MsMpEng.exe", None)
+    monkeypatch.setattr(probe, "snapshot_processes", lambda: real() + [fake_defender])
+    lg.tick()
+    assert latest_markers(lg.conn) == {"Windows Defender"}
+    monkeypatch.setattr(probe, "snapshot_processes",
+                        lambda: [p for p in real() if p.name.lower() != "msmpeng.exe"])
+    lg.clock = lambda: 1060.0
+    lg.tick()
+    assert latest_markers(lg.conn) == set()

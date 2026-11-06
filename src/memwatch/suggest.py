@@ -8,10 +8,10 @@ from typing import Callable
 
 from .config import Config
 from .db import (
-    all_apps, hourly_max, latest_groups, latest_system, list_actions,
-    startup_entries, system_ticks_since, typical_private, used_day_count,
+    all_apps, hourly_max, latest_groups, latest_markers, latest_procs, latest_system,
+    list_actions, startup_entries, system_ticks_since, typical_private, used_day_count,
 )
-from .models import AppSummary, Report, Suggestion
+from .models import AppRecord, AppSummary, Report, StartupEntry, Suggestion
 
 _HISTORY_DAYS = 30
 _AUTOSTART_SOURCES = frozenset({"run", "startup_folder", "packaged", "service"})
@@ -115,6 +115,27 @@ def _day(ts: int):
     return datetime.fromtimestamp(ts).date()
 
 
+def startup_by_app(conn, apps: dict[str, AppRecord] | None = None,
+                   present: dict | None = None) -> dict[str, list[StartupEntry]]:
+    """Startup entries per app key. A service entry joins the group that hosts that
+    service (a shared svchost group is keyed `service:a+b`, its entries `service:a`),
+    preferring a group seen in the latest tick."""
+    if apps is None:
+        apps = {a.app_key: a for a in all_apps(conn)}
+    if present is None:
+        present = latest_groups(conn)
+    host: dict[str, str] = {}
+    for key in sorted(apps, key=lambda k: k in present):  # present groups win
+        for s in apps[key].services:
+            host[s.lower()] = key
+    out: dict[str, list[StartupEntry]] = defaultdict(list)
+    for e in startup_entries(conn):
+        key = host.get(e.location.lower(), e.app_key) if e.source == "service" else e.app_key
+        if key:
+            out[key].append(e)
+    return out
+
+
 def build_report(
     conn,
     cfg: Config,
@@ -144,14 +165,15 @@ def build_report(
     logger_ws = system.logger_ws if system else None
     logger_over_cap = logger_ws is not None and logger_ws > cfg.logger_cap_mb * 2**20
 
+    data_ts = system.ts if system else None
+    stale = data_ts is not None and now - data_ts > 3 * interval
+
     present = latest_groups(conn)
+    n_procs = latest_procs(conn)
     sparks = hourly_max(conn, now - 48 * 3600)
     typicals = typical_private(conn, since)
     apps = {a.app_key: a for a in all_apps(conn)}
-    entries_by_app: dict[str, list] = defaultdict(list)
-    for e in startup_entries(conn):
-        if e.app_key:
-            entries_by_app[e.app_key].append(e)
+    entries_by_app = startup_by_app(conn, apps, present)
 
     cands = {k: apps[k] for k in present
              if k in apps and apps[k].kind != "protected" and k not in exclude_keys}
@@ -164,13 +186,22 @@ def build_report(
                 return True
         return False
 
-    # DUPLICATE: category membership by app label (case-insensitive)
+    # DUPLICATE: category membership by app label (case-insensitive). Protected
+    # products (Defender) have no app row; they count through the tick's markers and
+    # never carry the reason themselves.
     dup: dict[str, tuple[str, list[str]]] = {}
+    by_label = {r.label.lower(): r for r in cands.values()}
+    marked = {m.lower() for m in latest_markers(conn)}
     for cat, members in cfg.categories.items():
-        by_label = {r.label.lower(): r for r in cands.values()}
-        here = [by_label[m.lower()] for m in members if m.lower() in by_label]
-        if len(here) >= 2:
-            labels = [r.label for r in here]
+        labels: list[str] = []
+        here = []
+        for m in members:
+            if m.lower() in by_label:
+                here.append(by_label[m.lower()])
+                labels.append(by_label[m.lower()].label)
+            elif m.lower() in marked:
+                labels.append(m)
+        if len(labels) >= 2:
             for r in here:
                 dup.setdefault(r.app_key, (cat, labels))
 
@@ -228,16 +259,20 @@ def build_report(
             continue
         caution = (cfg.notes.get(key, "Part of Windows; turning it off may affect some features.")
                    if rec.microsoft else None)
-        modes: list[str] = []
-        if rec.services:
-            modes = ["manual", "disabled"]
-            if any(dependents(s) for s in rec.services):
-                modes.remove("disabled")
         startup = sorted(entries_by_app.get(key, []), key=lambda e: not e.enabled)
+        # Modes come from the service startup entries a disable would change, not from
+        # running services: an Automatic-but-stopped service still needs a choice.
+        svc_entries = [e.location for e in startup if e.source == "service" and e.can_disable]
+        modes: list[str] = []
+        if svc_entries:
+            modes = ["manual", "disabled"]
+            if any(dependents(s) for s in svc_entries):
+                modes.remove("disabled")
         typical = typicals.get(key, priv)
         suggestions.append(Suggestion(
             key, rec.label, rec.kind, priv, ws, typical, rec.last_used, idle_s, reasons,
-            codes, rec.has_windows_ever, caution, rec.limited, startup, modes))
+            codes, rec.has_windows_ever, caution, rec.limited, startup, modes,
+            list(rec.services), n_procs.get(key, 0)))
 
     suggestions.sort(key=lambda s: (set(s.reason_codes) <= {"DUPLICATE", "STANDALONE"},
                                     -s.private_bytes))
@@ -246,4 +281,5 @@ def build_report(
         now=now, system=system, observed_hours=observed_hours, partial_note=partial_note,
         reclaimable=sum(s.private_bytes for s in suggestions), suggestions=suggestions,
         apps=summaries, kernel_note=kernel_note, uptime_s=uptime_s, logger_ws=logger_ws,
-        logger_over_cap=logger_over_cap, undo=list_actions(conn))
+        logger_over_cap=logger_over_cap, undo=list_actions(conn), data_ts=data_ts,
+        stale=stale)

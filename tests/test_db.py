@@ -79,3 +79,32 @@ def test_hourly_max_typical_and_used_days(conn):
     assert hourly_max(conn, 3600)["a"] == [(1, 20), (72, 5)]
     assert typical_private(conn, 0) == {"a": 10}  # only ts=0, 3600, 259200 pass the thinning
     assert used_day_count(conn, "a", 0) == 2 and used_day_count(conn, "b", 0) == 0
+
+
+def test_latest_groups_follows_latest_system_tick(conn):
+    write_tick(conn, mk_sys(1), [(mk_group("a", 10), NONE)])
+    write_tick(conn, mk_sys(2), [])  # a tick where no group was written
+    assert latest_groups(conn) == {}
+
+
+def test_markers_written_read_and_pruned(conn):
+    from memwatch.db import latest_markers
+
+    write_tick(conn, mk_sys(0), [], markers=["Windows Defender"])
+    assert latest_markers(conn) == {"Windows Defender"}
+    write_tick(conn, mk_sys(31 * 86400), [])
+    assert latest_markers(conn) == set()  # only the latest tick counts
+    prune(conn, now=31 * 86400, retention_days=30)
+    assert conn.execute("SELECT COUNT(*) FROM markers").fetchone()[0] == 0
+
+
+def test_set_startup_enabled(conn):
+    from memwatch.db import set_startup_enabled
+
+    e = StartupEntry("run", "Foo", r"HKCU\Foo", "foo.exe", True, False, True, None, "suite:foo")
+    f = StartupEntry("run", "Bar", r"HKCU\Bar", "bar.exe", True, False, True, None, "suite:bar")
+    replace_startup(conn, [e, f])
+    set_startup_enabled(conn, "run", r"HKCU\Foo", False)
+    assert [x.enabled for x in startup_entries(conn)] == [False, True]
+    set_startup_enabled(conn, "run", r"HKCU\Foo", True)
+    assert [x.enabled for x in startup_entries(conn)] == [True, True]

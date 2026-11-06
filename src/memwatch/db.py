@@ -36,6 +36,8 @@ CREATE TABLE IF NOT EXISTS apps(
 CREATE TABLE IF NOT EXISTS startup(
     source TEXT, name TEXT, location TEXT, command TEXT, enabled INTEGER,
     needs_admin INTEGER, can_disable INTEGER, note TEXT, app_key TEXT);
+CREATE TABLE IF NOT EXISTS markers(
+    ts INTEGER, name TEXT, PRIMARY KEY(ts, name));
 CREATE TABLE IF NOT EXISTS actions(
     id INTEGER PRIMARY KEY, ts INTEGER, app_key TEXT, action TEXT,
     entry_json TEXT, before_json TEXT, undone INTEGER DEFAULT 0);
@@ -56,9 +58,14 @@ def write_tick(
     conn: sqlite3.Connection,
     system: SystemSnapshot,
     apps: list[tuple[AppGroup, UsageFlags]],
+    markers: list[str] | tuple[str, ...] = (),
 ) -> None:
+    """One tick. `markers` name products seen running this tick that have no app row
+    of their own (protected ones such as Windows Defender)."""
     ts = system.ts
     with conn:
+        conn.executemany("INSERT OR IGNORE INTO markers VALUES(?,?)",
+                         [(ts, m) for m in markers])
         conn.execute(
             f"INSERT OR REPLACE INTO system({','.join(_SYSTEM_COLS)}) "
             f"VALUES({','.join('?' * len(_SYSTEM_COLS))})",
@@ -92,6 +99,7 @@ def prune(conn: sqlite3.Connection, now: int, retention_days: int) -> int:
     with conn:
         n = conn.execute("DELETE FROM samples WHERE ts < ?", (cutoff,)).rowcount
         conn.execute("DELETE FROM system WHERE ts < ?", (cutoff,))
+        conn.execute("DELETE FROM markers WHERE ts < ?", (cutoff,))
         conn.execute("DELETE FROM apps WHERE last_seen < ?", (cutoff,))
     return n
 
@@ -129,9 +137,21 @@ def all_apps(conn: sqlite3.Connection) -> list[AppRecord]:
 
 
 def latest_groups(conn: sqlite3.Connection) -> dict[str, tuple[int, int, int]]:
+    """Groups present at the latest logged tick (the newest `system` row)."""
     return {k: (ts, priv, ws) for k, ts, priv, ws in conn.execute(
         "SELECT app_key, ts, private_bytes, working_set FROM samples "
-        "WHERE ts = (SELECT MAX(ts) FROM samples)")}
+        "WHERE ts = (SELECT MAX(ts) FROM system)")}
+
+
+def latest_procs(conn: sqlite3.Connection) -> dict[str, int]:
+    """Process count per group at the latest logged tick."""
+    return dict(conn.execute(
+        "SELECT app_key, n_procs FROM samples WHERE ts = (SELECT MAX(ts) FROM system)"))
+
+
+def latest_markers(conn: sqlite3.Connection) -> set[str]:
+    return {r[0] for r in conn.execute(
+        "SELECT name FROM markers WHERE ts = (SELECT MAX(ts) FROM system)")}
 
 
 def replace_startup(conn: sqlite3.Connection, entries: list[StartupEntry]) -> None:
@@ -144,6 +164,14 @@ def replace_startup(conn: sqlite3.Connection, entries: list[StartupEntry]) -> No
               int(e.needs_admin), int(e.can_disable), e.note, e.app_key)
              for e in entries],
         )
+
+
+def set_startup_enabled(conn: sqlite3.Connection, source: str, location: str,
+                        enabled: bool) -> None:
+    """Reflect a change memwatch just made, until the logger's next inventory."""
+    with conn:
+        conn.execute("UPDATE startup SET enabled = ? WHERE source = ? AND location = ?",
+                     (int(enabled), source, location))
 
 
 def startup_entries(conn: sqlite3.Connection) -> list[StartupEntry]:

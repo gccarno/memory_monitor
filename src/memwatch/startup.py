@@ -219,6 +219,14 @@ def _packaged_entries(cfg: Config) -> list[StartupEntry]:
     return out
 
 
+WINDOWS_TASK_NOTE = "Windows system task"
+
+
+def is_windows_task(location: str) -> bool:
+    """Tasks under \\Microsoft\\Windows\\ belong to Windows: shown read-only, never changed."""
+    return location.lower().startswith("\\microsoft\\windows\\")
+
+
 def _user_names() -> set[str]:
     u = os.environ.get("USERNAME", "").lower()
     if not u:
@@ -250,10 +258,46 @@ def _task_entries(cfg: Config) -> list[StartupEntry]:
         mine = author in me or (author in ("", "n/a") and runas in me)
         admin = not (name.startswith("\\") and mine)
         exe = parse_command(cmd) if cmd and cmd.upper() != "N/A" else ""
+        system = is_windows_task(name)
         out.append(StartupEntry("task", ntpath.basename(name), name, cmd,
                                 (row.get("Scheduled Task State") or "").lower() == "enabled",
-                                admin, True, None, _key_for(exe, name, cfg)))
+                                admin, not system, WINDOWS_TASK_NOTE if system else None,
+                                _key_for(exe, name, cfg)))
     return out
+
+
+def task_enabled(name: str) -> bool | None:
+    """Live state of one scheduled task; None when it cannot be read."""
+    try:
+        r = subprocess.run(["schtasks", "/query", "/tn", name, "/fo", "csv", "/nh"],
+                           capture_output=True, text=True, timeout=30,
+                           creationflags=0x08000000)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if r.returncode != 0:
+        return None
+    for row in csv.reader(io.StringIO(r.stdout)):
+        if len(row) >= 3:
+            return row[2].strip().lower() != "disabled"
+    return None
+
+
+def live_enabled(entry: StartupEntry, root: str = "") -> bool | None:
+    """Current state of a non-service entry read from Windows, or None when unreadable."""
+    try:
+        if entry.source in ("run", "startup_folder"):
+            hive, kind, name = _approved_target(entry)
+            return approved_is_enabled(
+                _read_approved(hive, kind, name, root if hive == "HKCU" else ""))
+        if entry.source == "packaged":
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _pkg_key(entry, root), 0,
+                                winreg.KEY_READ) as k:
+                return winreg.QueryValueEx(k, "State")[0] in (2, 4)
+        if entry.source == "task":
+            return task_enabled(entry.location)
+    except OSError:
+        return None
+    return None
 
 
 def _service_entries(cfg: Config) -> list[StartupEntry]:
@@ -332,6 +376,8 @@ def elevated_ops_for(entry: StartupEntry, enabled: bool, mode: str | None) -> li
     """Ops for the UAC runner (admin-only changes). Fails closed on anything unsupported."""
     if not entry.can_disable:
         raise ValueError(f"{entry.name!r} cannot be changed: {entry.note or 'no supported switch'}")
+    if entry.source == "task" and is_windows_task(entry.location):
+        raise ValueError(f"{entry.name!r} cannot be changed: {WINDOWS_TASK_NOTE}")
     if entry.source in ("run", "startup_folder"):
         hive, kind, name = _approved_target(entry)
         data = approved_bytes(enabled, 0 if enabled else _now_filetime())

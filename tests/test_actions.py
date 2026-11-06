@@ -481,3 +481,65 @@ def test_delayed_auto_service_round_trips_exactly(conn, cfg, monkeypatch):
     assert elev.calls == [[{"op": "set_service_start", "name": "WSearch", "start": "delayed-auto"}]]
     from memwatch.elevated_runner import validate
     assert validate(elev.calls[0][0])
+
+
+# ---- final-review fixes: live state, table sync ---------------------------
+
+def test_double_disable_records_once(conn, cfg, test_root):
+    e = dummy_run_entry(test_root)
+    assert disable_startup(conn, "suite:dummy", [e], None, cfg, elevator=no_elev,
+                           root=test_root).status == "done"
+    # the second click still carries the stale enabled=True entry
+    r = disable_startup(conn, "suite:dummy", [e], None, cfg, elevator=no_elev, root=test_root)
+    assert r.status == "done" and "already off" in r.message
+    assert len(list_actions(conn)) == 1
+    # undo restores the true original (enabled), not the already-disabled bytes
+    assert undo(conn, list_actions(conn)[0].id, cfg, elevator=no_elev, root=test_root).status == "done"
+    assert entry_enabled(test_root, "DummyApp")
+
+
+def test_disable_then_undo_updates_startup_table_and_report(conn, cfg, test_root):
+    from conftest import seed_ticks
+    from memwatch.db import replace_startup, startup_entries
+    from memwatch.suggest import build_report
+
+    e = dummy_run_entry(test_root)
+    replace_startup(conn, [e])
+    seed_ticks(conn, "suite:dummy", n=10, priv=600 << 20, label="Dummy")
+    assert disable_startup(conn, "suite:dummy", [e], None, cfg, elevator=no_elev,
+                           root=test_root).status == "done"
+    assert [x.enabled for x in startup_entries(conn)] == [False]
+    r = build_report(conn, cfg, now=600)
+    assert r.apps[0].autostart is False and r.suggestions[0].startup[0].enabled is False
+    rec = list_actions(conn)[0]
+    assert undo(conn, rec.id, cfg, elevator=no_elev, root=test_root).status == "done"
+    assert [x.enabled for x in startup_entries(conn)] == [True]
+    r = build_report(conn, cfg, now=600)
+    assert r.apps[0].autostart is True and r.suggestions[0].startup[0].enabled is True
+
+
+def test_live_state_already_off_service_is_skipped(conn, cfg, monkeypatch):
+    monkeypatch.setattr(actions, "_service_start", lambda name: "demand")  # already Manual
+    svc = StartupEntry("service", "Tobii Service", "TobiiSvc", "", True, True, True, None, "suite:tobii")
+    r = disable_startup(conn, "suite:tobii", [svc], "manual", cfg, elevator=no_elev)
+    assert r.status == "done" and "already off" in r.message and list_actions(conn) == []
+
+
+def test_windows_system_task_never_reaches_elevator(conn, cfg):
+    t = StartupEntry("task", "FamilySafety", r"\Microsoft\Windows\Shell\FamilySafety", "",
+                     True, True, True, None, "suite:x")  # stale row that still says can_disable
+    r = disable_startup(conn, "suite:x", [t], None, cfg, elevator=no_elev)
+    assert r.status == "failed" and "Windows system task" in r.message
+    assert list_actions(conn) == []
+
+
+def test_elevated_undo_updates_startup_table(conn, cfg, monkeypatch):
+    from memwatch.db import replace_startup, startup_entries
+
+    monkeypatch.setattr(actions, "_service_start", lambda name: "auto")
+    svc = StartupEntry("service", "Tobii Service", "TobiiSvc", "", True, True, True, None, "suite:tobii")
+    replace_startup(conn, [svc])
+    disable_startup(conn, "suite:tobii", [svc], "manual", cfg, elevator=FakeElevator())
+    assert [x.enabled for x in startup_entries(conn)] == [False]
+    undo(conn, list_actions(conn)[0].id, cfg, elevator=FakeElevator())
+    assert [x.enabled for x in startup_entries(conn)] == [True]

@@ -135,6 +135,8 @@ class Suggestion:
     limited: bool
     startup: list[StartupEntry]
     service_modes: list[str]
+    services: list[str] = field(default_factory=list)  # read-only parts list
+    n_procs: int = 0
 
 
 @dataclass
@@ -161,3 +163,5 @@ class Report:
     logger_ws: int | None
     logger_over_cap: bool
     undo: list[ActionRecord]
+    data_ts: int | None = None  # ts of the latest logged tick
+    stale: bool = False  # the logger has not written for > 3 sample intervals

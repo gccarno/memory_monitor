@@ -98,7 +98,9 @@ class Logger:
             probe.seconds_since_input() >= cfg.user_away_s, cfg)
         system = probe.system_snapshot(ts, procs)
         system = dataclasses.replace(system, logger_ws=int(self._self.memory_info().wset))
-        write_tick(self.conn, system, [(g, flags[k]) for k, g in groups.items()])
+        markers = {m.lower(): label for m, label in cfg.process_markers.items()}
+        seen = sorted({markers[p.name.lower()] for p in procs if p.name.lower() in markers})
+        write_tick(self.conn, system, [(g, flags[k]) for k, g in groups.items()], seen)
         self._prev = {(p.pid, p.create_time): (p.cpu_s or 0.0, p.io_bytes or 0) for p in procs}
 
     def _delay(self) -> float:

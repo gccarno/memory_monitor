@@ -52,18 +52,28 @@ def test_protected_and_excluded_never_suggested(conn, cfg):
 
 
 def test_duplicate_antivirus_and_ranking(conn, cfg):
-    seed_ticks(conn, "suite:reason security", n=10, priv=300 << 20, label="Reason Security")
-    seed_ticks(conn, "suite:windows defender", n=10, priv=500 << 20, label="Windows Defender")
-    seed_ticks(conn, "suite:zoom", n=10, priv=1900 << 20, label="Zoom")
+    # Defender is protected: present only as a process-name marker, never as an app row.
+    for i in range(10):
+        write_tick(conn, mk_sys(i * 60), [
+            (mk_group(k, p << 20, label=lbl, kind=kind), UsageFlags(False, False, False))
+            for k, p, lbl, kind in [
+                ("suite:reason security", 300, "Reason Security", "suite"),
+                ("protected:windows", 500, "Windows core", "protected"),
+                ("suite:zoom", 1900, "Zoom", "suite")]
+        ], markers=["Windows Defender"])
     r = build_report(conn, cfg, now=600)
-    assert r.suggestions[0].app_key == "suite:zoom"
-    assert any(c.startswith("Duplicate: 2 antivirus") for c in r.suggestions[-1].reasons)
+    assert [s.app_key for s in r.suggestions] == ["suite:zoom", "suite:reason security"]
     assert r.suggestions[-1].reasons[-1] == (
         "Duplicate: 2 antivirus products running (Reason Security, Windows Defender)")
 
 
+def svc_entry(name, key):
+    return StartupEntry("service", name, name, "svchost.exe -k x", True, True, True, None, key)
+
+
 def test_service_modes_drop_disabled_with_dependents(conn, cfg):
     seed_ticks(conn, "service:wsearch", n=10, priv=50 << 20, kind="windows", microsoft=True, services=["WSearch"])
+    replace_startup(conn, [svc_entry("WSearch", "service:wsearch")])
     s = build_report(conn, cfg, now=600, dependents=lambda svc: ["WMPNetworkSvc"]).suggestions[0]
     assert s.service_modes == ["manual"] and s.caution.startswith("Windows Search indexing")
     s = build_report(conn, cfg, now=600, dependents=lambda svc: []).suggestions[0]
@@ -232,6 +242,7 @@ def test_default_dependents_falls_back_to_registry(monkeypatch):
 
 def test_unknown_dependents_drop_disabled(conn, cfg):
     seed_ticks(conn, "service:foo", n=5, priv=10 << 20, kind="windows", services=["Foo"])
+    replace_startup(conn, [svc_entry("Foo", "service:foo")])
     s = build_report(conn, cfg, now=300, dependents=lambda svc: ["<unknown>"]).suggestions[0]
     assert s.service_modes == ["manual"]
 
@@ -268,3 +279,104 @@ def test_build_report_is_fast_on_realistic_history(conn, cfg):
     assert len(r.apps) == n_apps and r.suggestions
     assert all(len(a.spark) <= 48 for a in r.apps) and r.apps[0].spark
     assert elapsed < 2.0
+
+
+# ---- final-review fixes ---------------------------------------------------
+
+def test_duplicate_antivirus_with_protected_defender(conn, cfg):
+    """Defender is protected (never a suggestion); its presence comes from the tick's
+    process-name marker, and only the non-protected product carries DUPLICATE."""
+    for i in range(10):
+        write_tick(conn, mk_sys(i * 60), [
+            (mk_group("suite:reason security", 300 << 20, label="Reason Security"),
+             UsageFlags(False, False, False)),
+            (mk_group("protected:windows", 500 << 20, kind="protected", label="Windows core"),
+             UsageFlags(False, False, False)),
+        ], markers=["Windows Defender"])
+    r = build_report(conn, cfg, now=600)
+    assert [s.app_key for s in r.suggestions] == ["suite:reason security"]
+    assert r.suggestions[0].reason_codes[-1] == "DUPLICATE"
+    assert r.suggestions[0].reasons[-1] == (
+        "Duplicate: 2 antivirus products running (Reason Security, Windows Defender)")
+
+
+def test_no_duplicate_when_defender_marker_absent(conn, cfg):
+    write_tick(conn, mk_sys(0), [(mk_group("suite:reason security", 300 << 20,
+                                           label="Reason Security"),
+                                  UsageFlags(False, False, False))], markers=["Windows Defender"])
+    write_tick(conn, mk_sys(60), [(mk_group("suite:reason security", 300 << 20,
+                                            label="Reason Security"),
+                                   UsageFlags(False, False, False))])
+    r = build_report(conn, cfg, now=60)
+    assert all("DUPLICATE" not in s.reason_codes for s in r.suggestions)
+
+
+def test_duplicate_browsers_still_work(conn, cfg):
+    seed_ticks(conn, "suite:google chrome", n=10, priv=300 << 20, label="Google Chrome")
+    seed_ticks(conn, "suite:firefox", n=10, priv=200 << 20, label="Firefox")
+    r = build_report(conn, cfg, now=600)
+    dups = [s for s in r.suggestions if "DUPLICATE" in s.reason_codes]
+    assert {s.app_key for s in dups} == {"suite:google chrome", "suite:firefox"}
+    assert dups[0].reasons[-1] == "Duplicate: 2 browser products running (Google Chrome, Firefox)"
+
+
+def test_stale_data_flag(conn, cfg):
+    tick(conn, 1000, "suite:a", priv=600 << 20)
+    r = build_report(conn, cfg, now=1000 + 3 * cfg.sample_interval_s)
+    assert r.data_ts == 1000 and r.stale is False
+    r = build_report(conn, cfg, now=1000 + 3 * cfg.sample_interval_s + 1)
+    assert r.data_ts == 1000 and r.stale is True
+
+
+def test_no_data_is_not_stale(tmp_path, cfg):
+    from memwatch.db import connect
+
+    c = connect(tmp_path / "e.db")
+    r = build_report(c, cfg, now=10**9)
+    assert r.data_ts is None and r.stale is False
+    c.close()
+
+
+def test_shared_svchost_startup_entry_maps_to_group(conn, cfg):
+    """A shared svchost group is keyed service:a+b; its services' startup entries
+    (keyed service:a) must attach to that group."""
+    now = _four_days(conn, key="service:bits+wuauserv")
+    conn.execute("UPDATE apps SET services_json = ?, has_windows_ever = 0",
+                 ('["BITS", "wuauserv"]',))
+    conn.commit()
+    e = StartupEntry("service", "Background Intelligent Transfer", "BITS", "svchost.exe -k x",
+                     True, True, True, None, "service:bits")
+    replace_startup(conn, [e])
+    r = build_report(conn, cfg, now=now, dependents=lambda s: [])
+    s = r.suggestions[0]
+    assert s.app_key == "service:bits+wuauserv"
+    assert [x.location for x in s.startup] == ["BITS"]
+    assert r.apps[0].autostart is True
+    from memwatch.suggest import startup_by_app
+    assert [x.location for x in startup_by_app(conn)["service:bits+wuauserv"]] == ["BITS"]
+
+
+def test_service_modes_come_from_service_startup_entries(conn, cfg):
+    """An Automatic-but-stopped service (not in the running group's services) still
+    gets a Manual/Disabled choice, and dependents are checked by its name."""
+    seed_ticks(conn, "suite:tobii", n=10, priv=600 << 20, label="Tobii")
+    e = StartupEntry("service", "Tobii Service", "TobiiSvc", r"C:\Program Files\Tobii\s.exe",
+                     True, True, True, None, "suite:tobii")
+    replace_startup(conn, [e])
+    asked = []
+    s = build_report(conn, cfg, now=600,
+                     dependents=lambda n: asked.append(n) or []).suggestions[0]
+    assert s.service_modes == ["manual", "disabled"] and asked == ["TobiiSvc"]
+    s = build_report(conn, cfg, now=600, dependents=lambda n: ["Dep"]).suggestions[0]
+    assert s.service_modes == ["manual"]
+
+
+def test_running_services_without_service_entries_get_no_modes(conn, cfg):
+    seed_ticks(conn, "suite:x", n=5, priv=900 << 20, services=["XSvc"])
+    assert build_report(conn, cfg, now=300, dependents=lambda n: []).suggestions[0].service_modes == []
+
+
+def test_suggestion_parts(conn, cfg):
+    seed_ticks(conn, "suite:x", n=5, priv=900 << 20, services=["XSvc"])
+    s = build_report(conn, cfg, now=300).suggestions[0]
+    assert s.services == ["XSvc"] and s.n_procs == 1

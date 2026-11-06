@@ -186,3 +186,26 @@ def test_parse_command(cmd, exe):
 def test_parse_command_expands_env(monkeypatch):
     monkeypatch.setenv("MWTEST", r"C:\Zed")
     assert parse_command(r"%MWTEST%\z.exe") == r"C:\Zed\z.exe"
+
+
+_CSV_HEAD = '"TaskName","Schedule Type","Task To Run","Author","Run As User","Scheduled Task State"\n'
+
+
+def test_windows_system_logon_tasks_are_read_only(monkeypatch, cfg):
+    import subprocess
+
+    import memwatch.startup as st
+
+    rows = (_CSV_HEAD
+            + r'"\Microsoft\Windows\Shell\FamilySafety","At logon time","C:\Windows\x.exe","Microsoft","SYSTEM","Enabled"' + "\n"
+            + r'"\Tobii\Logon","At logon time","C:\Program Files\Tobii\t.exe","Tobii","SYSTEM","Enabled"' + "\n")
+    monkeypatch.setattr(st.subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(a, 0, rows, ""))
+    ms, tobii = st._task_entries(cfg)
+    assert ms.can_disable is False and ms.note == "Windows system task"
+    assert tobii.can_disable is True and tobii.note is None
+    with pytest.raises(ValueError):
+        elevated_ops_for(ms, False, None)
+    # even a stale row that still says can_disable never reaches the runner
+    stale = StartupEntry("task", "X", r"\Microsoft\Windows\X", "", True, True, True, None, None)
+    with pytest.raises(ValueError):
+        elevated_ops_for(stale, False, None)

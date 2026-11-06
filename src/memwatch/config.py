@@ -78,6 +78,12 @@ _CATEGORIES = {
     "browser": ["Google Chrome", "Firefox", "Microsoft Edge"],
 }
 
+# Products that are protected (no app row of their own) but still count for the
+# duplicate-category reason: lower-case process name -> product label.
+_PROCESS_MARKERS = {
+    "msmpeng.exe": "Windows Defender",
+}
+
 _NOTES = {
     "service:wsearch": "Windows Search indexing: Start-menu and File Explorer search get slower without it.",
     "service:sysmain": "SysMain preloads apps you use often; turning it off frees memory but apps may open a bit slower.",
@@ -118,6 +124,7 @@ class Config:
         default_factory=lambda: {k: list(v) for k, v in _CATEGORIES.items()}
     )
     notes: dict[str, str] = field(default_factory=lambda: dict(_NOTES))
+    process_markers: dict[str, str] = field(default_factory=lambda: dict(_PROCESS_MARKERS))
 
 
 def load_config(path: Path | None = None) -> Config:
