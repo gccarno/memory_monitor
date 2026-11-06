@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>memwatch</title>
+<link rel="stylesheet" href="/static/report.css">
+</head>
+<body>
+<main>
+  <header class="top">
+    <h1>memwatch</h1>
+    <button id="refresh" class="btn ghost" type="button">Refresh</button>
+  </header>
+  <div id="error" class="banner" role="alert" hidden></div>
+
+  <section id="pressure" aria-labelledby="h-pressure">
+    <h2 id="h-pressure">Pressure now</h2>
+    <div class="card" id="pressure-body">Loading…</div>
+  </section>
+
+  <section aria-labelledby="h-suggest">
+    <h2 id="h-suggest">Suggestions</h2>
+    <div id="suggestions" class="stack"></div>
+  </section>
+
+  <section aria-labelledby="h-apps">
+    <h2 id="h-apps">All apps</h2>
+    <div class="card table-wrap">
+      <table id="apps">
+        <thead><tr>
+          <th>App</th>
+          <th class="num"><button id="sort-size" class="sort" type="button" aria-label="Sort by size">Size <span id="sort-arrow">▼</span></button></th>
+          <th class="hide-narrow">Last 48 h</th>
+          <th>Last used</th>
+          <th>Autostart</th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section aria-labelledby="h-fixed">
+    <h2 id="h-fixed">Not fixable here</h2>
+    <div class="card" id="fixed-body"></div>
+  </section>
+
+  <section aria-labelledby="h-undo">
+    <h2 id="h-undo">Undo</h2>
+    <div class="card" id="undo-body"></div>
+  </section>
+</main>
+<script src="/static/report.js"></script>
+</body>
+</html>
