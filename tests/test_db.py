@@ -68,3 +68,14 @@ def test_startup_replace(conn):
     assert startup_entries(conn) == [e, f]
     replace_startup(conn, [f])
     assert startup_entries(conn) == [f]
+
+
+def test_hourly_max_typical_and_used_days(conn):
+    from memwatch.db import hourly_max, typical_private, used_day_count
+
+    for ts, priv, fg in [(0, 10, True), (60, 30, False), (3600, 20, False), (3 * 86400, 5, True)]:
+        write_tick(conn, mk_sys(ts), [(mk_group("a", priv), UsageFlags(fg, fg, False))])
+    assert hourly_max(conn, 0)["a"] == [(0, 30), (1, 20), (72, 5)]
+    assert hourly_max(conn, 3600)["a"] == [(1, 20), (72, 5)]
+    assert typical_private(conn, 0) == {"a": 10}  # only ts=0, 3600, 259200 pass the thinning
+    assert used_day_count(conn, "a", 0) == 2 and used_day_count(conn, "b", 0) == 0

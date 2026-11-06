@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import statistics
 from pathlib import Path
 
 from .models import (
@@ -183,3 +184,32 @@ def get_action(conn: sqlite3.Connection, id: int) -> ActionRecord | None:
 def mark_undone(conn: sqlite3.Connection, id: int) -> None:
     with conn:
         conn.execute("UPDATE actions SET undone = 1 WHERE id = ?", (id,))
+
+
+def hourly_max(conn: sqlite3.Connection, since: int) -> dict[str, list[tuple[int, int]]]:
+    """Per app, (hour, max private_bytes) buckets at or after `since`, oldest first."""
+    out: dict[str, list[tuple[int, int]]] = {}
+    for key, h, mx in conn.execute(
+        "SELECT app_key, ts / 3600 AS h, MAX(private_bytes) FROM samples "
+        "WHERE ts >= ? GROUP BY app_key, h ORDER BY app_key, h", (since,)
+    ):
+        out.setdefault(key, []).append((h, mx))
+    return out
+
+
+def typical_private(conn: sqlite3.Connection, since: int) -> dict[str, int]:
+    """Per app, median private_bytes over a thinned sample of history (roughly one
+    tick in ten, chosen by timestamp so the filter runs on the index, not the table)."""
+    vals: dict[str, list[int]] = {}
+    for key, priv in conn.execute(
+        "SELECT app_key, private_bytes FROM samples WHERE ts >= ? AND ts % 600 < 60", (since,)
+    ):
+        vals.setdefault(key, []).append(priv)
+    return {k: int(statistics.median(v)) for k, v in vals.items()}
+
+
+def used_day_count(conn: sqlite3.Connection, key: str, since: int) -> int:
+    """Distinct local calendar days with at least one foreground sample."""
+    return conn.execute(
+        "SELECT COUNT(DISTINCT date(ts, 'unixepoch', 'localtime')) FROM samples "
+        "WHERE app_key = ? AND ts >= ? AND foreground = 1", (key, since)).fetchone()[0]

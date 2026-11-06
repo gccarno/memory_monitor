@@ -9,6 +9,7 @@ from memwatch.models import AppGroup, SystemSnapshot
 @pytest.fixture
 def conn(tmp_path):
     c = connect(tmp_path / "memwatch.db")
+    c.execute("PRAGMA synchronous=OFF")  # tests seed thousands of ticks
     yield c
     c.close()
 

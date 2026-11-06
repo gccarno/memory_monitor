@@ -1,7 +1,6 @@
 """Turn the logged history into plain-English stop suggestions."""
 from __future__ import annotations
 
-import statistics
 from bisect import bisect_left, bisect_right
 from collections import defaultdict
 from datetime import datetime
@@ -9,8 +8,8 @@ from typing import Callable
 
 from .config import Config
 from .db import (
-    all_apps, app_history, latest_groups, latest_system, list_actions,
-    startup_entries, system_ticks_since,
+    all_apps, hourly_max, latest_groups, latest_system, list_actions,
+    startup_entries, system_ticks_since, typical_private, used_day_count,
 )
 from .models import AppSummary, Report, Suggestion
 
@@ -53,34 +52,67 @@ def default_service_desc(service: str) -> str:
         return ""
 
 
-def default_dependents(service: str) -> list[str]:
-    try:
-        import win32service
+_UNKNOWN = ["<unknown>"]
 
-        scm = win32service.OpenSCManager(None, None, win32service.SC_MANAGER_CONNECT)
+
+def _scm_dependents(service: str) -> list[str]:
+    import win32service
+
+    scm = win32service.OpenSCManager(None, None, win32service.SC_MANAGER_CONNECT)
+    try:
+        h = win32service.OpenService(scm, service, win32service.SERVICE_ENUMERATE_DEPENDENTS)
         try:
-            h = win32service.OpenService(scm, service, win32service.SERVICE_ENUMERATE_DEPENDENTS)
-            try:
-                found = win32service.EnumDependentServices(h, win32service.SERVICE_ACTIVE)
-            finally:
-                win32service.CloseServiceHandle(h)
+            found = win32service.EnumDependentServices(h, win32service.SERVICE_ACTIVE)
         finally:
-            win32service.CloseServiceHandle(scm)
-        return [str(item[0]) for item in found]
+            win32service.CloseServiceHandle(h)
+    finally:
+        win32service.CloseServiceHandle(scm)
+    return [str(item[0]) for item in found]
+
+
+def _registry_dependents(service: str) -> list[str]:
+    """Running services that list `service` in DependOnService (readable without admin)."""
+    import winreg
+
+    import psutil
+
+    want = service.lower()
+    out: list[str] = []
+    base = r"SYSTEM\CurrentControlSet\Services"
+    with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, base) as root:
+        for i in range(winreg.QueryInfoKey(root)[0]):
+            name = winreg.EnumKey(root, i)
+            try:
+                with winreg.OpenKey(root, name) as k:
+                    deps, _ = winreg.QueryValueEx(k, "DependOnService")
+            except OSError:
+                continue
+            if want not in [d.lower() for d in deps]:
+                continue
+            try:
+                running = psutil.win_service_get(name).status() == "running"
+            except Exception:
+                running = True  # cannot tell: assume it is running
+            if running:
+                out.append(name)
+    return out
+
+
+def default_dependents(service: str) -> list[str]:
+    """Running dependents of a service. Fails closed: if they cannot be determined,
+    returns a non-empty sentinel so callers never offer 'disabled'. Never raises."""
+    try:
+        return _scm_dependents(service)
     except Exception:
-        return []
+        pass
+    try:
+        return _registry_dependents(service)
+    except Exception:
+        return list(_UNKNOWN)
 
 
 def _day(ts: int):
     return datetime.fromtimestamp(ts).date()
-
-
-def _spark(samples) -> list[int]:
-    buckets: dict[int, int] = {}
-    for s in samples:
-        h = s.ts // 3600
-        buckets[h] = max(buckets.get(h, 0), s.private_bytes)
-    return [buckets[h] for h in sorted(buckets)[-48:]]
 
 
 def build_report(
@@ -113,7 +145,8 @@ def build_report(
     logger_over_cap = logger_ws is not None and logger_ws > cfg.logger_cap_mb * 2**20
 
     present = latest_groups(conn)
-    history = app_history(conn, since)
+    sparks = hourly_max(conn, now - 48 * 3600)
+    typicals = typical_private(conn, since)
     apps = {a.app_key: a for a in all_apps(conn)}
     entries_by_app: dict[str, list] = defaultdict(list)
     for e in startup_entries(conn):
@@ -145,7 +178,6 @@ def build_report(
     summaries: list[AppSummary] = []
     for key, rec in cands.items():
         _, priv, ws = present[key]
-        samples = history.get(key, [])
         instance = rec.kind == "instance"
         if rec.last_used is None:
             n_idle = len(ticks) - bisect_left(ticks, rec.first_seen)
@@ -176,7 +208,7 @@ def build_report(
             add("LONG_RUNNING", f"Running for {fmt_dur(age)}")
         is_auto = autostart(rec)
         if is_auto and observed_days >= cfg.rare_min_observed_days:
-            used_days = len({_day(s.ts) for s in samples if s.foreground})
+            used_days = used_day_count(conn, key, since)
             if used_days <= cfg.rare_max_days_used:
                 add("AUTOSTART_RARE",
                     f"Starts with Windows but you used it on only {used_days} of the last "
@@ -191,7 +223,7 @@ def build_report(
             add("DUPLICATE",
                 f"Duplicate: {len(labels)} {cat} products running ({', '.join(labels)})")
 
-        summaries.append(AppSummary(key, rec.label, priv, rec.last_used, is_auto, _spark(samples)))
+        summaries.append(AppSummary(key, rec.label, priv, rec.last_used, is_auto, [mx for _, mx in sparks.get(key, [])][-48:]))
         if not codes:
             continue
         caution = (cfg.notes.get(key, "Part of Windows; turning it off may affect some features.")
@@ -202,7 +234,7 @@ def build_report(
             if any(dependents(s) for s in rec.services):
                 modes.remove("disabled")
         startup = sorted(entries_by_app.get(key, []), key=lambda e: not e.enabled)
-        typical = int(statistics.median(s.private_bytes for s in samples)) if samples else priv
+        typical = typicals.get(key, priv)
         suggestions.append(Suggestion(
             key, rec.label, rec.kind, priv, ws, typical, rec.last_used, idle_s, reasons,
             codes, rec.has_windows_ever, caution, rec.limited, startup, modes))

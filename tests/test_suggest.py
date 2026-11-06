@@ -16,7 +16,9 @@ def test_idle_counts_only_observed_time(conn, cfg):
     tick(conn, 60, "suite:discord", priv=200 << 20)
     tick(conn, 5 * 86400, "suite:discord", priv=200 << 20)
     s = build_report(conn, cfg, now=5 * 86400)
-    assert all("IDLE" not in x.reason_codes for x in s.suggestions)  # only 2 minutes observed
+    assert [a.app_key for a in s.apps] == ["suite:discord"]  # present, but not idle
+    assert s.suggestions == []  # only 2 minutes observed
+    assert s.apps[0].last_used == 0
 
 
 def test_large_idle_sentence(conn, cfg):
@@ -44,6 +46,9 @@ def test_protected_and_excluded_never_suggested(conn, cfg):
     seed_ticks(conn, "python:9:1", n=10, priv=5 << 30, kind="instance")
     keys = [s.app_key for s in build_report(conn, cfg, now=600, exclude_keys={"python:9:1"}).suggestions]
     assert keys == []
+    r = build_report(conn, cfg, now=600)
+    assert {a.app_key for a in r.apps} == {"python:9:1"}  # protected is not an app row
+    assert [x.app_key for x in r.suggestions] == ["python:9:1"]  # positive control
 
 
 def test_duplicate_antivirus_and_ranking(conn, cfg):
@@ -186,10 +191,9 @@ def test_report_extras(conn, cfg):
 
 
 def test_typical_private_is_median(conn, cfg):
-    for i, p in enumerate([100, 900, 700, 700]):
-        tick(conn, i * 60, "suite:a", priv=p << 20, windows=True)
-    tick(conn, 240, "suite:a", priv=800 << 20, windows=True)
-    s = build_report(conn, cfg, now=240).suggestions[0]
+    for i, p in enumerate([100, 900, 700, 700, 800]):  # one tick per hour
+        tick(conn, i * 3600, "suite:a", priv=p << 20, windows=True)
+    s = build_report(conn, cfg, now=4 * 3600).suggestions[0]
     assert s.typical_private == 700 << 20
 
 
@@ -200,6 +204,67 @@ def test_formatters():
     assert fmt_dur(48 * 3600) == "2 days" and fmt_dur(86400 * 3 + 5) == "3 days"
 
 
-def test_defaults_never_raise():
-    assert default_dependents("definitely-not-a-service-xyz") == []
+def test_default_service_desc_never_raises():
     assert default_service_desc("definitely-not-a-service-xyz") == ""
+
+
+def test_default_dependents_fails_closed(monkeypatch):
+    import memwatch.suggest as sg
+
+    def boom(_):
+        raise OSError("access denied")
+
+    monkeypatch.setattr(sg, "_scm_dependents", boom)
+    monkeypatch.setattr(sg, "_registry_dependents", boom)
+    assert default_dependents("RpcSs") == ["<unknown>"]
+
+
+def test_default_dependents_falls_back_to_registry(monkeypatch):
+    import memwatch.suggest as sg
+
+    def denied(_):
+        raise OSError("access denied")
+
+    monkeypatch.setattr(sg, "_scm_dependents", denied)
+    monkeypatch.setattr(sg, "_registry_dependents", lambda s: ["Dep1"])
+    assert default_dependents("X") == ["Dep1"]
+
+
+def test_unknown_dependents_drop_disabled(conn, cfg):
+    seed_ticks(conn, "service:foo", n=5, priv=10 << 20, kind="windows", services=["Foo"])
+    s = build_report(conn, cfg, now=300, dependents=lambda svc: ["<unknown>"]).suggestions[0]
+    assert s.service_modes == ["manual"]
+
+
+def test_default_dependents_live_never_raises():
+    assert isinstance(default_dependents("definitely-not-a-service-xyz"), list)
+
+
+def test_build_report_is_fast_on_realistic_history(conn, cfg):
+    import time
+
+    n_apps, n_ticks = 130, 7 * 1440
+    base = int(datetime(2026, 1, 1, 0, 0).timestamp())
+    ts_list = [base + i * 60 for i in range(n_ticks)]
+    conn.executemany(
+        "INSERT INTO system VALUES(?,?,?,?,?,?,?,?,?,?)",
+        [(t, 16 << 30, 8 << 30, 10 << 30, 24 << 30, None, 100 << 20, 50 << 20, 0, None)
+         for t in ts_list])
+    for a in range(n_apps):
+        key = f"suite:app{a}"
+        conn.execute(
+            "INSERT INTO apps VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (key, f"app{a}", "suite", 0, base, ts_list[-1], base if a % 3 == 0 else None,
+             None, 1, 0, "[]"))
+        conn.executemany(
+            "INSERT INTO samples VALUES(?,?,?,?,?,?,?)",
+            [(t, key, (50 + a + i % 7) << 20, 40 << 20, 3, int(a % 3 == 0 and i % 500 == 0), 0)
+             for i, t in enumerate(ts_list)])
+    conn.commit()
+    start = time.perf_counter()
+    r = build_report(conn, cfg, now=ts_list[-1])
+    elapsed = time.perf_counter() - start
+    print(f"build_report took {elapsed:.2f}s")
+    assert len(r.apps) == n_apps and r.suggestions
+    assert all(len(a.spark) <= 48 for a in r.apps) and r.apps[0].spark
+    assert elapsed < 2.0
