@@ -2,6 +2,8 @@
 HKCU\\Software\\memwatch-test only. Elevation is always a fake injected here."""
 from __future__ import annotations
 
+import os
+import signal
 import subprocess
 import sys
 import time
@@ -12,7 +14,7 @@ import psutil
 import pytest
 
 from memwatch import actions
-from memwatch.actions import disable_startup, force_kill, stop_now, undo
+from memwatch.actions import _SELF_MSG, disable_startup, force_kill, stop_now, undo
 from memwatch.db import get_action, list_actions
 from memwatch.models import AppGroup, StartupEntry
 from memwatch.probe import window_pids
@@ -40,12 +42,45 @@ class FakeElevator:
         return [{"ok": self.ok, "error": None if self.ok else "boom"} for _ in ops]
 
 
+class Spawned:
+    """A fixture process started through launch.py, so it is NOT a descendant of the
+    test process (memwatch never acts on its own descendants). Popen-like API."""
+
+    def __init__(self, pid: int):
+        self.pid = pid
+        self.proc = psutil.Process(pid)
+
+    def poll(self):
+        try:
+            alive = self.proc.is_running() and self.proc.status() != psutil.STATUS_ZOMBIE
+        except psutil.Error:
+            alive = False
+        return None if alive else 0
+
+    def kill(self):
+        if self.poll() is None:  # is_running() re-checks create_time: still ours
+            os.kill(self.pid, signal.SIGTERM)  # TerminateProcess, bypasses psutil patches
+
+    def wait(self, timeout=10):
+        try:
+            code = self.proc.wait(timeout)
+        except psutil.NoSuchProcess:
+            return 0
+        return 0 if code is None else code
+
+
 @pytest.fixture
 def spawn():
-    procs: list[subprocess.Popen] = []
+    procs: list = []
 
-    def _spawn(script, *args, **kw):
-        p = subprocess.Popen([PY, str(FIXTURES / script), *args], **kw)
+    def _spawn(script, *args, direct=False):
+        cmd = [str(FIXTURES / script), *args]
+        if direct:  # a real child of the test process
+            p = subprocess.Popen([PY, *cmd])
+        else:
+            r = subprocess.run([PY, str(FIXTURES / "launch.py"), *cmd], capture_output=True,
+                               text=True, timeout=30, check=True)
+            p = Spawned(int(r.stdout.strip()))
         procs.append(p)
         return p
 
@@ -54,12 +89,11 @@ def spawn():
         if p.poll() is None:
             p.kill()
         p.wait(10)
-        if p.stdout:
-            p.stdout.close()
 
 
-def group_of(p, kind="suite", services=()):
-    return AppGroup("suite:test", "Test app", kind, [(p.pid, psutil.Process(p.pid).create_time())],
+def group_of(*ps, kind="suite", services=()):
+    return AppGroup("suite:test", "Test app", kind,
+                    [(p.pid, psutil.Process(p.pid).create_time()) for p in ps],
                     0, 0, list(services), False, False)
 
 
@@ -170,13 +204,62 @@ def test_own_process_is_never_touched(cfg):
     g = AppGroup("instance:me", "me", "instance", [(me.pid, me.create_time())], 0, 0, [],
                  False, False)
     for fn in (stop_now, force_kill):
-        assert fn(g, cfg, elevator=no_elev).status == "failed"
+        r = fn(g, cfg, elevator=no_elev)
+        assert (r.status, r.message) == ("failed", _SELF_MSG)
 
 
-def test_force_kill_takes_children(cfg, spawn):
-    p = spawn("sleeper.py", "--child", stdout=subprocess.PIPE, text=True)
-    child_pid = int(p.stdout.readline())
-    child = psutil.Process(child_pid)
+def test_own_descendant_is_never_touched(cfg, spawn):
+    p = spawn("sleeper.py", direct=True)  # a child of this (memwatch) process
+    for fn in (stop_now, force_kill):
+        r = fn(group_of(p), cfg, elevator=no_elev)
+        assert (r.status, r.message) == ("failed", _SELF_MSG)
+    assert p.poll() is None
+
+
+def test_memwatch_cmdline_process_is_never_touched(cfg, spawn):
+    p = spawn("sleeper.py", "-m", "memwatch")  # looks like `python -m memwatch ...`
+    for fn in (stop_now, force_kill):
+        r = fn(group_of(p), cfg, elevator=no_elev)
+        assert (r.status, r.message) == ("failed", _SELF_MSG)
+        assert r.remaining_pids == [p.pid]
+    assert p.poll() is None
+
+
+def test_force_kill_reports_untouchable_survivor_as_partial(cfg, spawn):
+    plain = spawn("sleeper.py")
+    mw = spawn("sleeper.py", "-m", "memwatch", "log")
+    r = force_kill(group_of(plain, mw), cfg, elevator=no_elev)
+    assert r.status == "partial" and r.remaining_pids == [mw.pid]
+    assert plain.wait(10) is not None and mw.poll() is None
+
+
+def test_stop_reports_untouchable_survivor_as_partial(cfg, spawn):
+    plain = spawn("sleeper.py")
+    mw = spawn("sleeper.py", "-m", "memwatch.report")
+    r = stop_now(group_of(plain, mw), cfg, elevator=no_elev)
+    assert r.status == "partial" and r.remaining_pids == [mw.pid]
+    assert plain.wait(10) is not None and mw.poll() is None
+
+
+def test_still_open_window_leaves_the_rest_untouched(cfg, spawn, monkeypatch):
+    win = spawn("window_app.py", "--stubborn"); wait_for_window(win.pid)
+    helper = spawn("sleeper.py")
+    monkeypatch.setattr(actions, "_service_running", lambda name: True)
+    monkeypatch.setattr(actions, "_dependents", lambda name: [])
+    cfg.close_timeout_s = 2
+    r = stop_now(group_of(win, helper, services=["FakeSvc"]), cfg, elevator=no_elev)
+    assert r.status == "still_open"
+    assert r.remaining_pids == sorted([win.pid, helper.pid])
+    assert helper.poll() is None and win.poll() is None
+
+
+def test_force_kill_takes_children(cfg, spawn, tmp_path):
+    pidfile = tmp_path / "child.pid"
+    p = spawn("sleeper.py", "--child", str(pidfile))
+    end = time.time() + 20
+    while not (pidfile.exists() and pidfile.read_text()) and time.time() < end:
+        time.sleep(0.1)
+    child = psutil.Process(int(pidfile.read_text()))
     try:
         assert force_kill(group_of(p), cfg, elevator=no_elev).status == "done"
         assert p.wait(10) is not None and not child.is_running()
@@ -218,6 +301,16 @@ def test_declined_elevation(cfg, spawn, monkeypatch):
     assert stop_now(g, cfg, elevator=FakeElevator(declined=True)).status == "declined"
     assert force_kill(g, cfg, elevator=FakeElevator(declined=True)).status == "declined"
     assert p.poll() is None
+
+
+@pytest.mark.parametrize("fn", [stop_now, force_kill])
+def test_declined_after_partial_work_is_partial(cfg, spawn, monkeypatch, fn):
+    easy, hard = spawn("sleeper.py"), spawn("sleeper.py")
+    _deny_terminate(monkeypatch, hard.pid)
+    r = fn(group_of(easy, hard), cfg, elevator=FakeElevator(declined=True))
+    assert r.status == "partial" and "declined" in r.message
+    assert r.remaining_pids == [hard.pid]
+    assert easy.wait(10) is not None and hard.poll() is None
 
 
 def test_services_with_dependents_are_skipped(cfg, monkeypatch):
@@ -289,10 +382,33 @@ def test_disable_and_undo_hkcu_entry(conn, cfg, test_root):
     assert undo(conn, rec.id, cfg, elevator=no_elev, root=test_root).status == "failed"
 
 
-def test_disable_startup_declined_records_nothing(conn, cfg):
+def test_disable_startup_declined_records_nothing(conn, cfg, monkeypatch):
+    monkeypatch.setattr(actions, "_service_start", lambda name: "auto")  # no real SCM read
     e = StartupEntry("service", "Tobii Service", "Tobii Service", "", True, True, True, None, "suite:tobii")
     r = disable_startup(conn, "suite:tobii", [e], "manual", cfg, elevator=lambda ops: "declined")
     assert r.status == "declined" and list_actions(conn) == []
+
+
+def test_unreadable_service_start_is_refused(conn, cfg, monkeypatch):
+    monkeypatch.setattr(actions, "_service_start", lambda name: None)  # unreadable / delayed
+    e = StartupEntry("service", "Tobii Service", "Tobii Service", "", True, True, True, None, "suite:tobii")
+    r = disable_startup(conn, "suite:tobii", [e], "manual", cfg, elevator=no_elev)
+    assert r.status == "failed" and "start type" in r.message and list_actions(conn) == []
+
+
+def test_mixed_batch_records_only_successes(conn, cfg, monkeypatch):
+    monkeypatch.setattr(actions, "_service_start", lambda name: "auto")
+    svc = StartupEntry("service", "Tobii Service", "Tobii Service", "", True, True, True, None, "suite:tobii")
+    task = StartupEntry("task", "Tobii Logon", r"\Tobii\Logon", "", True, True, True, None, "suite:tobii")
+    calls = []
+
+    def elevator(ops):
+        calls.append(ops)
+        return [{"ok": True, "error": None}, {"ok": False, "error": "access is denied"}]
+    r = disable_startup(conn, "suite:tobii", [svc, task], "manual", cfg, elevator=elevator)
+    assert len(calls) == 1 and len(calls[0]) == 2
+    assert r.status == "partial" and "Tobii Logon" in r.message and "access is denied" in r.message
+    assert [x.entry["name"] for x in list_actions(conn)] == ["Tobii Service"]
 
 
 def test_admin_entries_share_one_elevation_and_undo(conn, cfg, monkeypatch):

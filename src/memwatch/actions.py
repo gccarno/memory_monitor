@@ -12,12 +12,14 @@ from memwatch import probe, startup
 from memwatch.config import Config
 from memwatch.db import get_action, mark_undone, record_action
 from memwatch.elevate import Elevator, run_elevated
+from memwatch.elevated_runner import is_memwatch_cmdline
 from memwatch.models import ActionRecord, ActionResult, AppGroup, StartupEntry
 from memwatch.suggest import default_dependents
 
 _CT_TOLERANCE = 1e-3
 _STILL_OPEN = "Still open; it may be waiting for you (unsaved work?)"
 _PROTECTED_MSG = "Windows core processes are never stopped"
+_SELF_MSG = "memwatch will not stop itself"
 _DECLINED = "Administrator approval was declined; nothing that needs it was changed"
 _FORCE_GRACE_S = 3
 _EXIT_WAIT_S = 5
@@ -47,13 +49,14 @@ def _call(elevator: Elevator, ops: list[dict]) -> list[dict] | str:
 # ---- process helpers ------------------------------------------------------
 
 def _guarded_pids() -> set[int]:
-    """memwatch itself and the process tree that launched it."""
+    """memwatch itself, its descendants, and the process tree that launched it."""
     me = psutil.Process()
     out = {me.pid}
-    try:
-        out |= {p.pid for p in me.parents()}
-    except psutil.Error:
-        pass
+    for rel in (me.parents, lambda: me.children(recursive=True)):
+        try:
+            out |= {p.pid for p in rel()}
+        except psutil.Error:
+            pass
     return out
 
 
@@ -77,12 +80,21 @@ def _name(p: psutil.Process) -> str:
         return ""
 
 
+def _is_memwatch(p: psutil.Process) -> bool:
+    try:
+        return is_memwatch_cmdline(p.cmdline())
+    except psutil.Error:
+        return False  # unreadable: elevated or other users' processes, never memwatch's
+
+
 def _untouchable(p: psutil.Process, cfg: Config, guarded: set[int],
                  svchost_ok: bool = False) -> str | None:
     """Why this process must never be stopped directly, or None. `svchost_ok` lets
     stop_now see service hosts; it stops their services and never terminates them."""
-    if p.pid in guarded or p.pid in (0, 4):
-        return "memwatch and the programs that started it are never stopped."
+    if p.pid in guarded or _is_memwatch(p):
+        return _SELF_MSG
+    if p.pid in (0, 4):
+        return _PROTECTED_MSG
     try:
         name = p.name()
     except psutil.Error:
@@ -159,31 +171,52 @@ def _service_running(name: str) -> bool:
         return True  # cannot tell: try to stop it
 
 
-def _finish(label: str, targets: list[psutil.Process], notes: list[str],
-            any_change: bool, incomplete: bool) -> ActionResult:
-    alive = [p.pid for p in targets if _alive(p)]
-    extra = (" " + " ".join(notes)) if notes else ""
-    if not alive and not incomplete:
+def _join(notes: list[str]) -> str:
+    return " ".join(dict.fromkeys(notes))
+
+
+def _remaining(*groups: list[psutil.Process]) -> list[int]:
+    return sorted({p.pid for g in groups for p in g if _alive(p)})
+
+
+def _finish(label: str, targets: list[psutil.Process], left: list[psutil.Process],
+            notes: list[str], any_change: bool, incomplete: bool) -> ActionResult:
+    """`targets` were acted on; `left` are group processes deliberately left alone."""
+    remaining = _remaining(targets, left)
+    extra = (" " + _join(notes)) if notes else ""
+    if not remaining and not incomplete:
         return ActionResult("done", f"Stopped {label}.{extra}")
-    if any_change or len(alive) < len(targets):
-        return ActionResult("partial", f"Stopped part of {label}.{extra}", sorted(alive))
-    return ActionResult("failed", f"Could not stop {label}.{extra}", sorted(alive))
+    if any_change or any(not _alive(p) for p in targets):
+        return ActionResult("partial", f"Stopped part of {label}.{extra}", remaining)
+    return ActionResult("failed", f"Could not stop {label}.{extra}", remaining)
+
+
+def _declined(label: str, changed: bool, notes: list[str], *groups) -> ActionResult:
+    """Elevation was declined: 'partial' when unelevated work already took effect."""
+    remaining = _remaining(*groups)
+    if changed:
+        msg = f"Stopped part of {label}. {_DECLINED}. {_join(notes)}".strip()
+        return ActionResult("partial", msg, remaining)
+    return ActionResult("declined", _DECLINED, remaining)
 
 
 def _guard_group(group: AppGroup, cfg: Config, svchost_ok: bool = False):
-    """(live processes, those we may act on, notes) or an ActionResult to return now."""
+    """(live, usable, left alone, notes), or an ActionResult to return now."""
     if group.kind == "protected":
         return ActionResult("failed", _PROTECTED_MSG)
     live = _live(group.pids)
     guarded = _guarded_pids()
-    notes, usable = [], []
+    usable, left, notes = [], [], []
     for p in live:
         why = _untouchable(p, cfg, guarded, svchost_ok)
         if why:
+            left.append(p)
             notes.append(why)
         else:
             usable.append(p)
-    return live, usable, notes
+    if live and not usable and set(notes) == {_SELF_MSG}:
+        return ActionResult("failed", _SELF_MSG, _remaining(left))
+    return live, usable, left, notes
 
 
 # ---- stop / force ---------------------------------------------------------
@@ -192,7 +225,7 @@ def stop_now(group: AppGroup, cfg: Config, elevator: Elevator | None = None) -> 
     guard = _guard_group(group, cfg, svchost_ok=True)
     if isinstance(guard, ActionResult):
         return guard
-    live, procs, notes = guard
+    live, procs, left, notes = guard
     hosts = probe.services_by_pid()
     group_svcs = {s.lower() for s in group.services}
     svc_hosts = []  # exit once their services stop
@@ -203,18 +236,21 @@ def stop_now(group: AppGroup, cfg: Config, elevator: Elevator | None = None) -> 
             if hosted <= group_svcs:
                 svc_hosts.append(p)
             else:
+                left.append(p)
                 notes.append(f"pid {p.pid} also runs other services and was left alone.")
         elif _name(p) == "svchost.exe":
             procs.remove(p)
+            left.append(p)
             notes.append(f"svchost.exe (pid {p.pid}) runs no service of this app "
                          "and was left alone.")
     running = [s for s in group.services if _service_running(s)]
     if not live and not running:
         return ActionResult("already_stopped", f"{group.label} is not running.")
     if not procs and not svc_hosts and not running:
-        return ActionResult("failed", " ".join(notes))
+        return ActionResult("failed", _join(notes), _remaining(left))
 
-    # Windowed processes: WM_CLOSE only, then wait.
+    # Windowed processes: WM_CLOSE only, then wait. Nothing else is touched until
+    # every window has gone.
     windows = _windows_by_pid()
     windowed = [p for p in procs if windows.get(p.pid)]
     windowless = [p for p in procs if not windows.get(p.pid)]
@@ -223,8 +259,7 @@ def stop_now(group: AppGroup, cfg: Config, elevator: Elevator | None = None) -> 
             _post_close(windows[p.pid])
         _gone, still = psutil.wait_procs(windowed, timeout=cfg.close_timeout_s)
         if still:
-            return ActionResult("still_open", _STILL_OPEN,
-                                sorted(p.pid for p in procs + svc_hosts if _alive(p)))
+            return ActionResult("still_open", _STILL_OPEN, _remaining(procs, svc_hosts))
         psutil.wait_procs(windowless, timeout=1)  # helpers often exit with their window
         windowless = [p for p in windowless if _alive(p)]
 
@@ -232,7 +267,7 @@ def stop_now(group: AppGroup, cfg: Config, elevator: Elevator | None = None) -> 
     ops = [_kill_op(p) for p in _terminate(windowless, "terminate")]
 
     # Services: only those without running dependents.
-    svc_ops, skipped = [], False
+    skipped = False
     for name in running:
         if name.lower() in cfg.protected_services:
             notes.append(f"{name} is a Windows core service and was not stopped.")
@@ -244,15 +279,14 @@ def stop_now(group: AppGroup, cfg: Config, elevator: Elevator | None = None) -> 
                          f"({', '.join(deps)}).")
             skipped = True
             continue
-        svc_ops.append({"op": "stop_service", "name": name})
-    ops += svc_ops
+        ops.append({"op": "stop_service", "name": name})
 
     failed_ops = stopped_svc = False
     if ops:
         res = _call(_elevator(elevator, cfg), ops)
         if res == "declined":
-            return ActionResult("declined", _DECLINED,
-                                sorted(p.pid for p in live if _alive(p)))
+            changed = bool(windowed) or any(not _alive(p) for p in windowless)
+            return _declined(group.label, changed, notes, procs, svc_hosts, left)
         for op, r in zip(ops, res):
             if r["ok"]:
                 stopped_svc = stopped_svc or op["op"] == "stop_service"
@@ -260,19 +294,17 @@ def stop_now(group: AppGroup, cfg: Config, elevator: Elevator | None = None) -> 
             failed_ops = True
             what = op["name"] if op["op"] == "stop_service" else f"pid {op['pid']}"
             notes.append(f"Could not stop {what}: {r['error']}.")
-    targets = windowed + windowless + svc_hosts
     psutil.wait_procs(windowless + svc_hosts, timeout=_EXIT_WAIT_S)
-    untouched = len(procs) + len(svc_hosts) < len(live)
-    return _finish(group.label, targets, notes,
+    return _finish(group.label, windowed + windowless + svc_hosts, left, notes,
                    any_change=bool(windowed) or stopped_svc,
-                   incomplete=skipped or failed_ops or untouched)
+                   incomplete=skipped or failed_ops)
 
 
 def force_kill(group: AppGroup, cfg: Config, elevator: Elevator | None = None) -> ActionResult:
     guard = _guard_group(group, cfg)
     if isinstance(guard, ActionResult):
         return guard
-    live, procs, notes = guard
+    live, procs, left, notes = guard
     if not live:
         return ActionResult("already_stopped", f"{group.label} is not running.")
     guarded = _guarded_pids()
@@ -293,7 +325,7 @@ def force_kill(group: AppGroup, cfg: Config, elevator: Elevator | None = None) -
             targets[c.pid] = c
             stack.append(c)
     if not targets:
-        return ActionResult("failed", " ".join(notes))
+        return ActionResult("failed", _join(notes), _remaining(left))
     procs = list(targets.values())
     denied = {p.pid: p for p in _terminate(procs, "terminate")}
     _gone, survivors = psutil.wait_procs([p for p in procs if p.pid not in denied],
@@ -305,14 +337,14 @@ def force_kill(group: AppGroup, cfg: Config, elevator: Elevator | None = None) -
         ops = [_kill_op(p) for p in denied.values()]
         res = _call(_elevator(elevator, cfg), ops)
         if res == "declined":
-            return ActionResult("declined", _DECLINED, sorted(p.pid for p in live if _alive(p)))
+            changed = any(not _alive(p) for p in procs if p.pid not in denied)
+            return _declined(group.label, changed, notes, procs, left)
         for op, r in zip(ops, res):
             if not r["ok"]:
                 failed_ops = True
                 notes.append(f"Could not stop pid {op['pid']}: {r['error']}.")
     psutil.wait_procs(procs, timeout=_EXIT_WAIT_S)
-    return _finish(group.label, procs, notes, any_change=False,
-                   incomplete=failed_ops or len(procs) < len(live))
+    return _finish(group.label, procs, left, notes, any_change=False, incomplete=failed_ops)
 
 
 # ---- startup --------------------------------------------------------------
@@ -322,7 +354,9 @@ def _is_local(e: StartupEntry) -> bool:
 
 
 def _service_start(name: str) -> str | None:
-    """Current start type as a runner `start` value; None when unknown or boot/system."""
+    """Current start type as a runner `start` value. None when it cannot be read or is
+    anything but plain auto/demand/disabled (boot, system, delayed auto): undo could not
+    put it back exactly."""
     try:
         import win32service as ws
 
@@ -331,11 +365,15 @@ def _service_start(name: str) -> str | None:
             h = ws.OpenService(scm, name, ws.SERVICE_QUERY_CONFIG)
             try:
                 code = ws.QueryServiceConfig(h)[1]
+                delayed = code == ws.SERVICE_AUTO_START and bool(ws.QueryServiceConfig2(
+                    h, ws.SERVICE_CONFIG_DELAYED_AUTO_START_INFO))
             finally:
                 ws.CloseServiceHandle(h)
         finally:
             ws.CloseServiceHandle(scm)
     except Exception:
+        return None
+    if delayed:
         return None
     return {ws.SERVICE_AUTO_START: "auto", ws.SERVICE_DEMAND_START: "demand",
             ws.SERVICE_DISABLED: "disabled"}.get(code)
@@ -350,8 +388,11 @@ def _hklm_approved(e: StartupEntry) -> str | None:
 def _capture_before(e: StartupEntry) -> dict:
     """What undo needs to put an elevated entry back exactly."""
     if e.source == "service":
-        # Inventory lists only automatic services; prefer the live value when readable.
-        return {"start": _service_start(e.location) or "auto"}
+        start = _service_start(e.location)
+        if start is None:
+            raise ValueError("its current start type could not be read exactly, "
+                             "so it was left unchanged")
+        return {"start": start}
     if e.source == "task":
         return {"enabled": bool(e.enabled)}
     if e.source in ("run", "startup_folder"):

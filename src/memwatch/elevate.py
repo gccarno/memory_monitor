@@ -1,4 +1,9 @@
-"""Send whitelisted ops to `elevated_runner` through a UAC prompt."""
+"""Send whitelisted ops to `elevated_runner` through a UAC prompt.
+
+The ops travel as one base64url JSON command-line argument (UAC fixes the command
+line when the user approves), never through a file. Only the result comes back via
+`data_dir\\elev-<uuid>-out.json`; a forged result can misreport, not execute.
+"""
 from __future__ import annotations
 
 import json
@@ -8,6 +13,7 @@ from pathlib import Path
 from typing import Callable, Literal
 
 from memwatch.config import Config
+from memwatch.elevated_runner import MAX_ARG_LEN, MAX_OPS, encode_ops
 
 Elevator = Callable[[list[dict]], "list[dict] | Literal['declined']"]
 
@@ -71,16 +77,18 @@ def _read_results(path: Path, n: int) -> list[dict]:
 def run_elevated(ops: list[dict], cfg: Config) -> list[dict] | Literal["declined"]:
     if not ops:
         return []
+    if len(ops) > MAX_OPS:
+        return _failed(len(ops), f"too many changes at once (max {MAX_OPS})")
+    arg = encode_ops(ops)
+    if len(arg) > MAX_ARG_LEN:
+        return _failed(len(ops), "too many changes at once")
     data_dir = Path(cfg.data_dir)
     data_dir.mkdir(parents=True, exist_ok=True)
-    uid = uuid.uuid4().hex
-    inp = data_dir / f"elev-{uid}-in.json"
-    out = data_dir / f"elev-{uid}-out.json"
+    out = data_dir / f"elev-{uuid.uuid4().hex}-out.json"
     try:
-        inp.write_text(json.dumps(ops), encoding="utf-8")
         try:
             rc = _run_as_admin(str(_pythonw()),
-                               ["-I", "-m", "memwatch.elevated_runner", str(inp), str(out)],
+                               ["-I", "-m", "memwatch.elevated_runner", arg, str(out)],
                                _TIMEOUT_S)
         except Exception as e:
             return _failed(len(ops), f"could not start elevated runner: {e}")
@@ -90,5 +98,4 @@ def run_elevated(ops: list[dict], cfg: Config) -> list[dict] | Literal["declined
             return _failed(len(ops), f"elevated runner did not finish within {_TIMEOUT_S} s")
         return _read_results(out, len(ops))
     finally:
-        inp.unlink(missing_ok=True)
         out.unlink(missing_ok=True)
