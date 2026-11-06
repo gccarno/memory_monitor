@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import ctypes
+import logging
 from ctypes import wintypes
 
 import psutil
@@ -9,6 +10,8 @@ import psutil
 from memwatch.models import ProcInfo, ServiceInfo, SystemSnapshot
 
 # (pid, create_time) -> (exe, cmdline, cwd, limited); pruned on every snapshot.
+log = logging.getLogger(__name__)
+
 _static_cache: dict[tuple[int, float], tuple[str | None, list[str] | None, str | None, bool]] = {}
 
 
@@ -145,7 +148,14 @@ def _compression_ws() -> int | None:
     return None
 
 
-def system_snapshot(ts: int) -> SystemSnapshot:
+def _compression_from_procs(procs: list[ProcInfo]) -> int | None:
+    for pi in procs:
+        if pi.name == "Memory Compression":
+            return None if pi.limited or not pi.working_set else pi.working_set
+    return None
+
+
+def system_snapshot(ts: int, procs: list[ProcInfo] | None = None) -> SystemSnapshot:
     pi = _PERF_INFO()
     pi.cb = ctypes.sizeof(pi)
     if not _psapi.GetPerformanceInfo(ctypes.byref(pi), pi.cb):
@@ -158,7 +168,7 @@ def system_snapshot(ts: int) -> SystemSnapshot:
         ram_avail=int(vm.available),
         commit_used=pi.CommitTotal * page,
         commit_limit=pi.CommitLimit * page,
-        compression_ws=_compression_ws(),
+        compression_ws=_compression_from_procs(procs) if procs is not None else _compression_ws(),
         pool_paged=pi.KernelPaged * page,
         pool_nonpaged=pi.KernelNonpaged * page,
         boot_time=int(psutil.boot_time()),
@@ -221,7 +231,8 @@ def all_services() -> list[ServiceInfo]:
     out: list[ServiceInfo] = []
     try:
         it = list(psutil.win_service_iter())
-    except Exception:
+    except (psutil.Error, OSError) as e:
+        log.warning("service enumeration failed: %s", e)
         return out
     for s in it:
         try:
@@ -234,8 +245,8 @@ def all_services() -> list[ServiceInfo]:
                 pid=d.get("pid") or None,
                 binpath=d.get("binpath") or "",
             ))
-        except Exception:
-            continue
+        except (psutil.Error, OSError, KeyError) as e:
+            log.debug("skipping service: %s", e)
     return out
 
 

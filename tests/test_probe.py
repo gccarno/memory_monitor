@@ -7,6 +7,7 @@ from contextlib import contextmanager
 import psutil
 
 from memwatch import probe
+from memwatch.models import ProcInfo
 from memwatch.probe import (
     all_services,
     foreground_pid,
@@ -118,5 +119,32 @@ def test_window_probes_return_sane_types():
 def test_services():
     svcs = all_services()
     assert svcs and all(s.start_type in ("automatic", "manual", "disabled") for s in svcs)
+    assert any(s.start_type == "automatic" for s in svcs)
     by_pid = services_by_pid()
     assert all(pid > 0 and lst for pid, lst in by_pid.items())
+
+
+def _pi(name, ws, limited=False):
+    return ProcInfo(pid=4, ppid=0, name=name, exe=None, cmdline=None, create_time=1.0,
+                    private_bytes=0, working_set=ws, cpu_s=None, io_bytes=None,
+                    cwd=None, limited=limited)
+
+
+def test_compression_ws_from_procs_found_denied_absent(monkeypatch):
+    def boom(*a, **k):
+        raise AssertionError("must not rescan when procs given")
+
+    monkeypatch.setattr(psutil, "process_iter", boom)
+    assert system_snapshot(1, [_pi("Memory Compression", 123)]).compression_ws == 123
+    assert system_snapshot(1, [_pi("Memory Compression", 0, limited=True)]).compression_ws is None
+    assert system_snapshot(1, [_pi("other", 5)]).compression_ws is None
+
+
+def test_all_services_enumeration_failure_logged(monkeypatch, caplog):
+    def bad():
+        raise OSError("scm down")
+
+    monkeypatch.setattr(psutil, "win_service_iter", bad)
+    with caplog.at_level("WARNING", logger="memwatch.probe"):
+        assert all_services() == []
+    assert "service enumeration failed" in caplog.text
