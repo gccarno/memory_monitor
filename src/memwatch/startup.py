@@ -316,6 +316,8 @@ def apply_toggle(entry: StartupEntry, enabled: bool, mode: str | None = None,
 
 
 def restore(entry: StartupEntry, before: dict, root: str = "") -> None:
+    if entry.source not in ("run", "startup_folder", "packaged") or entry.needs_admin:
+        raise ValueError(f"restore does not support {entry.source} entry {entry.name!r}")
     if entry.source == "packaged":
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _pkg_key(entry, root), 0,
                             winreg.KEY_SET_VALUE) as k:
@@ -327,7 +329,9 @@ def restore(entry: StartupEntry, before: dict, root: str = "") -> None:
 
 
 def elevated_ops_for(entry: StartupEntry, enabled: bool, mode: str | None) -> list[dict]:
-    """Ops for the UAC runner (admin-only changes)."""
+    """Ops for the UAC runner (admin-only changes). Fails closed on anything unsupported."""
+    if not entry.can_disable:
+        raise ValueError(f"{entry.name!r} cannot be changed: {entry.note or 'no supported switch'}")
     if entry.source in ("run", "startup_folder"):
         hive, kind, name = _approved_target(entry)
         data = approved_bytes(enabled, 0 if enabled else _now_filetime())
@@ -336,6 +340,11 @@ def elevated_ops_for(entry: StartupEntry, enabled: bool, mode: str | None) -> li
     if entry.source == "task":
         return [{"op": "set_task", "name": entry.location, "enabled": enabled}]
     if entry.source == "service":
-        start = "auto" if enabled else ("disabled" if mode == "disabled" else "demand")
-        return [{"op": "set_service_start", "name": entry.location, "start": start}]
-    return []
+        if enabled:
+            starts = {None: "auto", "auto": "auto", "demand": "demand", "manual": "demand"}
+        else:
+            starts = {"manual": "demand", "disabled": "disabled"}
+        if mode not in starts:
+            raise ValueError(f"invalid service mode {mode!r}")
+        return [{"op": "set_service_start", "name": entry.location, "start": starts[mode]}]
+    raise ValueError(f"{entry.source} entries are changed with apply_toggle, not elevated ops")
