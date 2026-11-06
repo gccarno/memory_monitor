@@ -15,6 +15,7 @@ from memwatch.models import ActionResult
 
 TOKEN = "tok-123"
 _REAL_EXCLUDE = server._exclude_keys
+_REAL_OWN_PIDS = server._own_pids
 
 
 class FakeActions:
@@ -269,8 +270,86 @@ def test_internal_errors_are_json_500(tmp_path, cfg, caplog):
 
 def test_body_cap_and_bad_content_length(srv, fake):
     big = '{"action": "stop", "app_key": "suite:steam", "pad": "' + "x" * 70000 + '"}'
-    assert post(srv, "/api/action", headers=AUTH, raw=big).status == 400  # truncated at 64 KB
+    assert post(srv, "/api/action", headers=AUTH, raw=big).status == 413  # over the 64 KB cap
     for cl in ("abc", "-5"):
         r = post(srv, "/api/action", headers={**AUTH, "Content-Length": cl}, raw="")
         assert r.status == 400
     assert fake.calls == []
+
+
+# ---- final-review fixes ---------------------------------------------------
+
+def test_disable_startup_finds_entries_of_shared_service_group(tmp_path, cfg, fake):
+    from memwatch.db import replace_startup
+    from memwatch.models import StartupEntry
+
+    path = tmp_path / "sh.db"
+    c = connect(path)
+    seed_ticks(c, "service:bits+wuauserv", 10, 50 << 20, kind="windows", services=["BITS", "wuauserv"])
+    replace_startup(c, [StartupEntry("service", "BITS", "BITS", "svchost.exe -k x", True, True,
+                                     True, None, "service:bits")])
+    c.close()
+    s = server.make_server(cfg, lambda: connect(path), TOKEN, actions_impl=fake,
+                           resolve=lambda key, cfg: mk_group(key, 1))
+    threading.Thread(target=s.serve_forever, daemon=True).start()
+    try:
+        r = post_json(s, "/api/action", {"action": "disable_startup",
+                                         "app_key": "service:bits+wuauserv", "mode": "manual"})
+        assert r["status"] == "done"
+        assert fake.calls == [("disable_startup", "service:bits+wuauserv", "manual", ["BITS"])]
+    finally:
+        s.shutdown(); s.server_close()
+
+
+def test_report_carries_data_ts_and_stale(srv):
+    rep = json.loads(get(srv, "/api/report", AUTH).body)
+    assert rep["data_ts"] == 29 * 60 and rep["stale"] is True  # seeded at epoch 0..29 min
+
+
+def _raw_post(port, path, headers, body: bytes):
+    """One POST on a fresh socket; returns the status code (ConnectionError propagates)."""
+    c = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+    try:
+        c.request("POST", path, body=body, headers={"Host": f"127.0.0.1:{port}", **headers})
+        r = c.getresponse()
+        r.read()
+        return r.status
+    finally:
+        c.close()
+
+
+def test_denied_and_oversized_posts_never_reset(srv, fake):
+    """Denied POSTs drain their body and oversized ones get 413, so Windows never
+    answers with RST (ConnectionAbortedError on the client) instead of a status."""
+    port = srv.server_address[1]
+    big = b"x" * 200_000
+    small = b"y" * 60_000
+    for i in range(200):
+        assert _raw_post(port, "/api/action", {}, small) == 403  # no token
+        assert _raw_post(port, "/api/action", AUTH, big) == 413
+        assert _raw_post(port, "/api/heartbeat", {"Origin": "https://evil.example", **AUTH},
+                         small) == 403
+    assert fake.calls == []
+
+
+def test_oversized_413_closes_connection(srv):
+    port = srv.server_address[1]
+    c = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+    c.request("POST", "/api/action", body=b"x" * 100_000,
+              headers={"Host": f"127.0.0.1:{port}", **AUTH})
+    r = c.getresponse()
+    r.read()
+    assert r.status == 413 and r.getheader("Connection") == "close"
+    c.close()
+
+
+def test_own_pids_include_children():
+    import subprocess
+    import sys
+
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        assert child.pid in _REAL_OWN_PIDS()
+    finally:
+        child.kill()
+        child.wait(10)

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import ctypes
 import logging
+import threading
 from ctypes import wintypes
 
 import psutil
@@ -13,10 +14,13 @@ from memwatch.models import ProcInfo, ServiceInfo, SystemSnapshot
 log = logging.getLogger(__name__)
 
 _static_cache: dict[tuple[int, float], tuple[str | None, list[str] | None, str | None, bool]] = {}
+# The report server snapshots from several request threads; guard every cache access.
+_static_cache_lock = threading.Lock()
 
 
 def _static_fields(p, key):
-    cached = _static_cache.get(key)
+    with _static_cache_lock:
+        cached = _static_cache.get(key)
     if cached is not None:
         return cached
     limited = False
@@ -30,7 +34,8 @@ def _static_fields(p, key):
             vals.append(None)
             limited = True
     entry = (vals[0], vals[1], vals[2], limited)
-    _static_cache[key] = entry
+    with _static_cache_lock:
+        _static_cache[key] = entry
     return entry
 
 
@@ -79,8 +84,9 @@ def snapshot_processes() -> list[ProcInfo]:
             create_time=ct, private_bytes=private, working_set=wset,
             cpu_s=cpu, io_bytes=io_bytes, cwd=cwd, limited=limited or lim2,
         ))
-    for k in [k for k in _static_cache if k not in seen]:
-        del _static_cache[k]
+    with _static_cache_lock:
+        for k in [k for k in _static_cache if k not in seen]:
+            del _static_cache[k]
     return out
 
 

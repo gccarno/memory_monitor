@@ -148,3 +148,34 @@ def test_all_services_enumeration_failure_logged(monkeypatch, caplog):
     with caplog.at_level("WARNING", logger="memwatch.probe"):
         assert all_services() == []
     assert "service enumeration failed" in caplog.text
+
+
+def test_static_cache_is_thread_safe(monkeypatch):
+    """The report server snapshots from several threads at once: concurrent pruning
+    and filling of the shared cache must never raise."""
+    import threading
+
+    gen = [0]
+
+    def fake_iter(*a, **k):
+        gen[0] += 1
+        base = (gen[0] % 7) * 50
+        return iter([FakeProc(base + i) for i in range(50)])
+
+    monkeypatch.setattr(psutil, "process_iter", fake_iter)
+    errors = []
+
+    def worker():
+        try:
+            for _ in range(300):
+                snapshot_processes()
+        except Exception as e:  # pragma: no cover - the failure we guard against
+            errors.append(e)
+
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(60)
+    assert errors == []
+    assert isinstance(probe._static_cache_lock, type(threading.Lock()))

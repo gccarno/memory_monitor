@@ -20,7 +20,7 @@ import psutil
 from memwatch import actions, db, grouping, probe
 from memwatch.config import Config
 from memwatch.models import ActionResult, Report
-from memwatch.suggest import build_report
+from memwatch.suggest import build_report, startup_by_app
 
 STATIC_DIR = Path(__file__).parent / "static"
 _STATIC = {
@@ -30,6 +30,7 @@ _STATIC = {
 }
 _ACTIONS = {"stop", "force", "disable_startup", "undo"}
 _MAX_BODY = 65536
+_DRAIN_LIMIT = 1 << 20  # oversized bodies are read (and dropped) up to this, then 413
 _SELF_MSG = "memwatch will not stop itself"
 log = logging.getLogger(__name__)
 
@@ -39,12 +40,15 @@ def report_to_json(r: Report) -> dict:
 
 
 def _own_pids() -> set[int]:
-    """This process and its launching tree."""
+    """This process, its launching tree, and anything it started (such as a browser
+    opened by webbrowser.open)."""
     mine = {os.getpid()}
-    try:
-        mine |= {p.pid for p in psutil.Process().parents()}
-    except psutil.Error:
-        pass
+    me = psutil.Process()
+    for rel in (me.parents, lambda: me.children(recursive=True)):
+        try:
+            mine |= {p.pid for p in rel()}
+        except psutil.Error:
+            pass
     return mine
 
 
@@ -115,6 +119,17 @@ class _Handler(BaseHTTPRequestHandler):
     def _deny(self) -> None:
         self._send(403, b"Forbidden", "text/plain; charset=utf-8")
 
+    def _too_large(self) -> None:
+        self.close_connection = True
+        self.send_response(413)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", "17")
+        self.send_header("Connection", "close")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        self.wfile.write(b"Payload too large")
+
     def _notfound(self) -> None:
         self._send(404, b"Not found", "text/plain; charset=utf-8")
 
@@ -183,16 +198,20 @@ class _Handler(BaseHTTPRequestHandler):
     # -- POST ---------------------------------------------------------------
     def do_POST(self):
         path = urlsplit(self.path).path
+        # Read the whole body before any reply, denials included: closing a socket with
+        # unread data makes Windows send RST, and the client sees a reset, not a status.
+        body = self._body()
+        if body is None:
+            return self._too_large()
         if not self._gate(True):
             return
         if path == "/api/heartbeat":
-            self._body()  # drain
             self.server.last_heartbeat = time.monotonic()
             return self._json(200, {"ok": True})
         if path != "/api/action":
             return self._notfound()
         try:
-            req = json.loads(self._body() or b"")
+            req = json.loads(body or b"")
         except (ValueError, UnicodeDecodeError):
             return self._json(400, {"error": "malformed JSON"})
         if not isinstance(req, dict) or req.get("action") not in _ACTIONS:
@@ -221,12 +240,21 @@ class _Handler(BaseHTTPRequestHandler):
         finally:
             self.server.action_finished()
 
-    def _body(self) -> bytes:
+    def _body(self) -> bytes | None:
+        """The request body, or None when it is over the cap (drained up to a limit)."""
         try:
-            n = int(self.headers.get("Content-Length") or 0)
+            n = max(int(self.headers.get("Content-Length") or 0), 0)
         except ValueError:
             n = 0
-        return self.rfile.read(min(max(n, 0), _MAX_BODY))
+        if n <= _MAX_BODY:
+            return self.rfile.read(n)
+        left = min(n, _DRAIN_LIMIT)
+        while left > 0:
+            chunk = self.rfile.read(min(left, 65536))
+            if not chunk:
+                break
+            left -= len(chunk)
+        return None
 
     def _act(self, conn: sqlite3.Connection, req: dict) -> ActionResult:
         srv = self.server
@@ -244,7 +272,7 @@ class _Handler(BaseHTTPRequestHandler):
                 if sug is None or "disabled" not in sug.service_modes:
                     return ActionResult("failed", "Disabling is not offered for this app; "
                                                   "use Manual instead.")
-            entries = [e for e in db.startup_entries(conn) if e.app_key == key]
+            entries = startup_by_app(conn).get(key, [])
             return impl.disable_startup(conn, key, entries, mode, cfg)
         group = srv.resolve(key, cfg)
         if group is None:
