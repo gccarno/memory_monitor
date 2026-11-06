@@ -14,6 +14,7 @@ from memwatch.db import connect
 from memwatch.models import ActionResult
 
 TOKEN = "tok-123"
+_REAL_EXCLUDE = server._exclude_keys
 
 
 class FakeActions:
@@ -193,3 +194,83 @@ def test_shuts_down_when_idle(tmp_path, cfg):
     t.start()
     t.join(3)
     assert not t.is_alive()
+
+
+def test_slow_action_outlives_heartbeat_timeout(tmp_path, cfg, fake):
+    cfg.heartbeat_timeout_s = 1
+    release = threading.Event()
+    started = threading.Event()
+
+    def slow_stop(group, cfg, elevator=None):
+        started.set()
+        release.wait(10)
+        return ActionResult("done", "slow done")
+
+    fake.stop_now = slow_stop
+    s = server.make_server(cfg, lambda: connect(tmp_path / "w.db"), TOKEN, actions_impl=fake,
+                           resolve=lambda key, cfg: mk_group(key, 1))
+    t = threading.Thread(target=server._run, args=(s, cfg, 0.1), daemon=True)
+    t.start()
+    assert post(s, "/api/heartbeat", {}, AUTH).status == 200
+    out = {}
+    c = threading.Thread(target=lambda: out.update(
+        r=post(s, "/api/action", {"action": "stop", "app_key": "suite:a"}, AUTH)))
+    c.start()
+    assert started.wait(3)
+    time.sleep(2)  # well past the heartbeat timeout
+    assert t.is_alive()
+    release.set()
+    c.join(5)
+    assert out["r"].status == 200 and json.loads(out["r"].body)["message"] == "slow done"
+    t.join(5)  # now the lapsed heartbeat may end it
+    assert not t.is_alive()
+
+
+def test_real_exclude_keys(monkeypatch, cfg):
+    from conftest import mkproc
+    procs = [
+        mkproc(10, 1, "me.exe", r"C:\Program Files\Mine\me.exe"),
+        mkproc(20, 1, "launcher.exe", r"C:\Program Files\Launch\launcher.exe"),
+        mkproc(30, 1, "python.exe", r"C:\Program Files\Py\python.exe",
+               cmdline=["python.exe", "-m", "memwatch", "log"]),
+        mkproc(40, 1, "other.exe", r"C:\Program Files\Other\other.exe"),
+    ]
+    monkeypatch.setattr(server.probe, "snapshot_processes", lambda: procs)
+    monkeypatch.setattr(server.probe, "services_by_pid", lambda: {})
+    monkeypatch.setattr(server, "_own_pids", lambda: {10, 20})
+    keys = _REAL_EXCLUDE(cfg)
+    by = {k: g for k, g in server.grouping.group_processes(procs, {}, cfg).items()}
+    key_of = {pid: k for k, g in by.items() for pid, _ in g.pids}
+    assert keys == {key_of[10], key_of[20], key_of[30]}
+    assert key_of[40] not in keys
+
+
+def test_internal_errors_are_json_500(tmp_path, cfg, caplog):
+    def boom(group, cfg, elevator=None):
+        raise RuntimeError("secret detail")
+
+    f = FakeActions()
+    f.stop_now = boom
+    s = server.make_server(cfg, lambda: connect(tmp_path / "e.db"), TOKEN, actions_impl=f,
+                           resolve=lambda key, cfg: mk_group(key, 1))
+    threading.Thread(target=s.serve_forever, daemon=True).start()
+    try:
+        with caplog.at_level("ERROR"):
+            r = post(s, "/api/action", {"action": "stop", "app_key": "suite:a"}, AUTH)
+        assert r.status == 500 and json.loads(r.body) == {"error": "internal error"}
+        assert b"secret" not in r.body and "secret detail" in caplog.text
+        s2 = server.make_server(cfg, lambda: (_ for _ in ()).throw(OSError("db gone")), TOKEN)
+        threading.Thread(target=s2.serve_forever, daemon=True).start()
+        assert get(s2, "/api/report", AUTH).status == 500
+        s2.shutdown(); s2.server_close()
+    finally:
+        s.shutdown(); s.server_close()
+
+
+def test_body_cap_and_bad_content_length(srv, fake):
+    big = '{"action": "stop", "app_key": "suite:steam", "pad": "' + "x" * 70000 + '"}'
+    assert post(srv, "/api/action", headers=AUTH, raw=big).status == 400  # truncated at 64 KB
+    for cl in ("abc", "-5"):
+        r = post(srv, "/api/action", headers={**AUTH, "Content-Length": cl}, raw="")
+        assert r.status == 400
+    assert fake.calls == []

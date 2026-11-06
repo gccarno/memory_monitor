@@ -106,7 +106,7 @@ class Config:
     logger_cap_mb: int = 50
     nonpaged_warn_mb: int = 500
     partial_hours: int = 72
-    heartbeat_timeout_s: int = 60
+    heartbeat_timeout_s: int = 180
     server_idle_timeout_s: int = 1800
     data_dir: Path = field(default_factory=_default_data_dir)
     protected_names: frozenset[str] = _PROTECTED_NAMES

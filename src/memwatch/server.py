@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import logging
 import os
 import secrets
 import sqlite3
@@ -18,7 +19,6 @@ import psutil
 
 from memwatch import actions, db, grouping, probe
 from memwatch.config import Config
-from memwatch.elevated_runner import is_memwatch_cmdline
 from memwatch.models import ActionResult, Report
 from memwatch.suggest import build_report
 
@@ -31,27 +31,34 @@ _STATIC = {
 _ACTIONS = {"stop", "force", "disable_startup", "undo"}
 _MAX_BODY = 65536
 _SELF_MSG = "memwatch will not stop itself"
+log = logging.getLogger(__name__)
 
 
 def report_to_json(r: Report) -> dict:
     return dataclasses.asdict(r)
 
 
-def _exclude_keys(cfg: Config) -> set[str]:
-    """Groups holding this server, its launching tree, or any memwatch process."""
-    procs = probe.snapshot_processes()
+def _own_pids() -> set[int]:
+    """This process and its launching tree."""
     mine = {os.getpid()}
     try:
         mine |= {p.pid for p in psutil.Process().parents()}
     except psutil.Error:
         pass
+    return mine
+
+
+def _exclude_keys(cfg: Config) -> set[str]:
+    """Groups holding this server, its launching tree, or any memwatch process."""
+    procs = probe.snapshot_processes()
+    mine = _own_pids()
     groups = grouping.group_processes(procs, probe.services_by_pid(), cfg)
     by_pid = {p.pid: p for p in procs}
     keys: set[str] = set()
     for key, g in groups.items():
         for pid, _ in g.pids:
             p = by_pid.get(pid)
-            if pid in mine or (p is not None and p.cmdline and is_memwatch_cmdline(p.cmdline)):
+            if pid in mine or (p is not None and p.cmdline and actions.is_memwatch_cmdline(p.cmdline)):
                 keys.add(key)
                 break
     return keys
@@ -69,6 +76,18 @@ class _Server(ThreadingHTTPServer):
         self.resolve = resolve
         self.last_request = time.monotonic()
         self.last_heartbeat: float | None = None
+        self.inflight = 0
+        self.lock = threading.Lock()
+
+    def action_started(self) -> None:
+        with self.lock:
+            self.inflight += 1
+
+    def action_finished(self) -> None:
+        with self.lock:
+            self.inflight -= 1
+            if self.last_heartbeat is not None:
+                self.last_heartbeat = time.monotonic()  # the page cannot beat while we worked
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -142,18 +161,24 @@ class _Handler(BaseHTTPRequestHandler):
             return self._notfound()
         self._send(200, (STATIC_DIR / name).read_bytes(), _STATIC[name])
 
-    def _build(self, conn: sqlite3.Connection) -> Report:
-        return build_report(conn, self.server.cfg, int(time.time()),
-                            exclude_keys=_exclude_keys(self.server.cfg))
+    def _build(self, conn: sqlite3.Connection, exclude: set[str]) -> Report:
+        return build_report(conn, self.server.cfg, int(time.time()), exclude_keys=exclude)
+
+    def _internal_error(self, what: str) -> None:
+        log.exception("%s failed", what)
+        self._json(500, {"error": "internal error"})
 
     def _report(self) -> None:
-        conn = self.server.conn_factory()
         try:
-            out = report_to_json(self._build(conn))
+            conn = self.server.conn_factory()
+            try:
+                out = report_to_json(self._build(conn, _exclude_keys(self.server.cfg)))
+            finally:
+                conn.close()
             out["logger_cap_mb"] = self.server.cfg.logger_cap_mb  # for the page only
-            self._json(200, out)
-        finally:
-            conn.close()
+        except Exception:
+            return self._internal_error("report")
+        self._json(200, out)
 
     # -- POST ---------------------------------------------------------------
     def do_POST(self):
@@ -183,12 +208,18 @@ class _Handler(BaseHTTPRequestHandler):
             return self._json(400, {"error": "app_key required"})
         if req.get("mode") not in (None, "manual", "disabled"):
             return self._json(400, {"error": "bad mode"})
-        conn = self.server.conn_factory()
+        self.server.action_started()
         try:
-            res = self._act(conn, req)
+            conn = self.server.conn_factory()
+            try:
+                res = self._act(conn, req)
+            finally:
+                conn.close()
+            self._json(200, dataclasses.asdict(res))
+        except Exception:
+            self._internal_error("action")
         finally:
-            conn.close()
-        self._json(200, dataclasses.asdict(res))
+            self.server.action_finished()
 
     def _body(self) -> bytes:
         try:
@@ -203,12 +234,13 @@ class _Handler(BaseHTTPRequestHandler):
         if action == "undo":
             return impl.undo(conn, req["action_id"], cfg)
         key = req["app_key"]
-        if key in _exclude_keys(cfg):
+        exclude = _exclude_keys(cfg)
+        if key in exclude:
             return ActionResult("failed", _SELF_MSG)
         if action == "disable_startup":
             mode = req.get("mode")
             if mode == "disabled":
-                sug = next((s for s in self._build(conn).suggestions if s.app_key == key), None)
+                sug = next((s for s in self._build(conn, exclude).suggestions if s.app_key == key), None)
                 if sug is None or "disabled" not in sug.service_modes:
                     return ActionResult("failed", "Disabling is not offered for this app; "
                                                   "use Manual instead.")
@@ -233,6 +265,8 @@ def _run(srv: _Server, cfg: Config, poll_s: float = 0.25) -> None:
         while not done.wait(poll_s):
             now = time.monotonic()
             hb = srv.last_heartbeat
+            if srv.inflight > 0:
+                continue
             if hb is not None:
                 lapsed = now - hb > cfg.heartbeat_timeout_s
             else:
@@ -246,6 +280,8 @@ def _run(srv: _Server, cfg: Config, poll_s: float = 0.25) -> None:
         srv.serve_forever()
     finally:
         done.set()
+        while srv.inflight > 0:  # let a half-finished change complete (and be recorded)
+            time.sleep(0.05)
         srv.server_close()
 
 
