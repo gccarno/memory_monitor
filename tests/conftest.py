@@ -55,6 +55,26 @@ def cfg():
     return load_config(Path("nonexistent.toml"))
 
 
+def tick(conn, ts, key, fg=False, priv=100 << 20, windows=False, pool_nonpaged=None,
+         **group_overrides):
+    from memwatch.db import write_tick
+    from memwatch.models import UsageFlags
+
+    sys_over = {} if pool_nonpaged is None else {"pool_nonpaged": pool_nonpaged}
+    write_tick(conn, mk_sys(ts, **sys_over),
+               [(mk_group(key, priv, **group_overrides), UsageFlags(fg, fg, windows))])
+
+
+def seed_ticks(conn, key, n, priv, kind="suite", label=None, microsoft=False,
+               services=None, start=0):
+    """n ticks, 60 s apart, beginning at tick index `start`; never foreground."""
+    over = dict(kind=kind, microsoft=microsoft, services=services or [])
+    if label:
+        over["label"] = label
+    for i in range(start, start + n):
+        tick(conn, i * 60, key, priv=priv, **over)
+
+
 def mkproc(pid: int, ppid: int, name: str, exe: str | None, cmdline=None, **overrides):
     from memwatch.models import ProcInfo
 

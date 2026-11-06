@@ -116,3 +116,48 @@ class ActionResult:
     status: str  # 'done'|'still_open'|'already_stopped'|'declined'|'failed'|'partial'
     message: str
     remaining_pids: list[int] = field(default_factory=list)
+
+
+@dataclass
+class Suggestion:
+    app_key: str
+    label: str
+    kind: str
+    private_bytes: int
+    working_set: int
+    typical_private: int
+    last_used: int | None
+    idle_observed_s: int
+    reasons: list[str]
+    reason_codes: list[str]
+    has_windows: bool
+    caution: str | None
+    limited: bool
+    startup: list[StartupEntry]
+    service_modes: list[str]
+
+
+@dataclass
+class AppSummary:
+    app_key: str
+    label: str
+    private_bytes: int
+    last_used: int | None
+    autostart: bool
+    spark: list[int]
+
+
+@dataclass
+class Report:
+    now: int
+    system: SystemSnapshot | None
+    observed_hours: float
+    partial_note: str | None
+    reclaimable: int
+    suggestions: list[Suggestion]
+    apps: list[AppSummary]
+    kernel_note: str | None
+    uptime_s: int
+    logger_ws: int | None
+    logger_over_cap: bool
+    undo: list[ActionRecord]
