@@ -64,6 +64,12 @@ _SUITE_OVERRIDES = {
     "\\android\\sdk\\": "Android SDK",
     "\\adobe\\": "Adobe",
     "\\displaylink\\": "DisplayLink",
+    "\\tobiiab.": "Tobii",
+    "\\google\\drive": "Google Drive",
+    "\\driverstore\\filerepository\\lenovo": "Lenovo Vantage",
+    "\\driverstore\\filerepository\\nv": "NVIDIA",
+    "\\elevocinstalldriver\\": "Elevoc",
+    "\\common files\\microsoft shared\\": "Microsoft Office",
 }
 
 _CATEGORIES = {
