@@ -390,7 +390,7 @@ def test_disable_startup_declined_records_nothing(conn, cfg, monkeypatch):
 
 
 def test_unreadable_service_start_is_refused(conn, cfg, monkeypatch):
-    monkeypatch.setattr(actions, "_service_start", lambda name: None)  # unreadable / delayed
+    monkeypatch.setattr(actions, "_service_start", lambda name: None)  # unreadable, boot or system
     e = StartupEntry("service", "Tobii Service", "Tobii Service", "", True, True, True, None, "suite:tobii")
     r = disable_startup(conn, "suite:tobii", [e], "manual", cfg, elevator=no_elev)
     assert r.status == "failed" and "start type" in r.message and list_actions(conn) == []
@@ -464,3 +464,20 @@ def test_cannot_disable_only(conn, cfg):
                         "Windows blocks changes", "suite:tobii")
     r = disable_startup(conn, "suite:tobii", [nope], "manual", cfg, elevator=no_elev)
     assert r.status == "failed" and "Windows blocks changes" in r.message
+
+
+def test_delayed_auto_service_round_trips_exactly(conn, cfg, monkeypatch):
+    monkeypatch.setattr(actions, "_service_start", lambda name: "delayed-auto")
+    svc = StartupEntry("service", "Windows Search", "WSearch", "", True, True, True, None,
+                       "service:wsearch")
+    elev = FakeElevator()
+    assert disable_startup(conn, "service:wsearch", [svc], "manual", cfg,
+                           elevator=elev).status == "done"
+    assert elev.calls == [[{"op": "set_service_start", "name": "WSearch", "start": "demand"}]]
+    (rec,) = list_actions(conn)
+    assert rec.before == {"start": "delayed-auto"}
+    elev = FakeElevator()
+    assert undo(conn, rec.id, cfg, elevator=elev).status == "done"
+    assert elev.calls == [[{"op": "set_service_start", "name": "WSearch", "start": "delayed-auto"}]]
+    from memwatch.elevated_runner import validate
+    assert validate(elev.calls[0][0])

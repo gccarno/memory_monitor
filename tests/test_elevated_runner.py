@@ -69,6 +69,10 @@ BAD_OPS = [
     {"op": "set_service_start", "name": "Foo", "start": []},
     {"op": "set_service_start", "name": "Foo", "start": {"auto": 1}},
     {"op": "set_service_start", "name": "Foo", "start": None},
+    {"op": "set_service_start", "name": "Foo", "start": "delayed"},
+    {"op": "set_service_start", "name": "Foo", "start": "Delayed-Auto"},
+    {"op": "set_service_start", "name": "Foo", "start": "boot"},
+    {"op": "set_service_start", "name": "Foo", "start": "system"},
     {"op": "set_approved", "hive": "HKCU", "subkey": RUN, "value": "X", "data_hex": "02"},
     {"op": "set_approved", "hive": ["HKLM"], "subkey": RUN, "value": "X", "data_hex": "02"},
     {"op": "set_approved", "hive": "HKLM", "subkey": {}, "value": "X", "data_hex": "02"},
@@ -114,7 +118,8 @@ def test_validate_accepts_well_formed_ops():
         {"op": "kill", "pid": 1234, "create_time": 1.5},
         {"op": "kill", "pid": 1234, "create_time": 2},
         {"op": "stop_service", "name": "Tobii Service"},
-        *({"op": "set_service_start", "name": "Foo", "start": s} for s in ("demand", "disabled", "auto")),
+        *({"op": "set_service_start", "name": "Foo", "start": s}
+          for s in ("demand", "disabled", "auto", "delayed-auto")),
         *({"op": "set_approved", "hive": "HKLM", "subkey": sk, "value": "X", "data_hex": "02" + "00" * 11}
           for sk in APPROVED_PATHS.values()),
         {"op": "set_approved", "hive": "HKLM", "subkey": RUN, "value": "X", "data_hex": None},

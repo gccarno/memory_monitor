@@ -26,7 +26,7 @@ ALLOWED = {
     "set_approved": {"hive", "subkey", "value", "data_hex"},
     "set_task": {"name", "enabled"},
 }
-_STARTS = ("demand", "disabled", "auto")
+_STARTS = ("demand", "disabled", "auto", "delayed-auto")
 MAX_OPS = 64
 MAX_ARG_LEN = 30_000  # encoded ops; well under the 32767-char command-line limit
 BUDGET_S = 100  # finish before run_elevated stops waiting (120 s)
@@ -213,14 +213,17 @@ def _set_service_start(name: str, start: str) -> None:
     import win32service as ws
 
     _service_guard(name)
-    code = {"auto": ws.SERVICE_AUTO_START, "demand": ws.SERVICE_DEMAND_START,
-            "disabled": ws.SERVICE_DISABLED}[start]
+    code = {"auto": ws.SERVICE_AUTO_START, "delayed-auto": ws.SERVICE_AUTO_START,
+            "demand": ws.SERVICE_DEMAND_START, "disabled": ws.SERVICE_DISABLED}[start]
     scm = ws.OpenSCManager(None, None, ws.SC_MANAGER_CONNECT)
     try:
         h = ws.OpenService(scm, name, ws.SERVICE_CHANGE_CONFIG)
         try:
             ws.ChangeServiceConfig(h, ws.SERVICE_NO_CHANGE, code, ws.SERVICE_NO_CHANGE,
                                    None, None, 0, None, None, None, None)
+            if code == ws.SERVICE_AUTO_START:  # auto and delayed-auto differ only here
+                ws.ChangeServiceConfig2(h, ws.SERVICE_CONFIG_DELAYED_AUTO_START_INFO,
+                                        start == "delayed-auto")
         finally:
             ws.CloseServiceHandle(h)
     finally:

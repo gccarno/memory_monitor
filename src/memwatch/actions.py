@@ -354,9 +354,9 @@ def _is_local(e: StartupEntry) -> bool:
 
 
 def _service_start(name: str) -> str | None:
-    """Current start type as a runner `start` value. None when it cannot be read or is
-    anything but plain auto/demand/disabled (boot, system, delayed auto): undo could not
-    put it back exactly."""
+    """Current start type as a runner `start` value (auto, delayed-auto, demand,
+    disabled). None when it cannot be read or is anything else (boot, system): undo
+    could not put it back exactly."""
     try:
         import win32service as ws
 
@@ -374,7 +374,7 @@ def _service_start(name: str) -> str | None:
     except Exception:
         return None
     if delayed:
-        return None
+        return "delayed-auto"
     return {ws.SERVICE_AUTO_START: "auto", ws.SERVICE_DEMAND_START: "demand",
             ws.SERVICE_DISABLED: "disabled"}.get(code)
 
