@@ -18,7 +18,7 @@ RUN_SUB = r"Software\Microsoft\Windows\CurrentVersion\Run"
 
 def read_hkcu_run(root, name):
     try:
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, f"{root}\{RUN_SUB}") as k:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, rf"{root}\{RUN_SUB}") as k:
             return winreg.QueryValueEx(k, name)[0]
     except FileNotFoundError:
         return None
@@ -33,7 +33,7 @@ def _delete_tree(path):
                     sub = winreg.EnumKey(k, 0)
                 except OSError:
                     break
-                _delete_tree(f"{path}\{sub}")
+                _delete_tree(rf"{path}\{sub}")
         winreg.DeleteKey(winreg.HKEY_CURRENT_USER, path)
     except FileNotFoundError:
         pass
@@ -131,3 +131,94 @@ def test_status_with_db(tmp_path, capsys, monkeypatch):
     assert "observed: 2.0 hours" in out
     assert "logger memory: 30 MB (cap 50 MB)" in out
     assert "db size: " in out and " MB" in out
+
+
+def _drop_memwatch_handlers():
+    import logging
+
+    lg = logging.getLogger("memwatch")
+    for h in list(lg.handlers):
+        lg.removeHandler(h)
+        h.close()
+
+
+@pytest.mark.parametrize("cmd,attr", [("report", "serve_report")])
+def test_report_failure_is_logged(tmp_path, monkeypatch, cmd, attr):
+    from memwatch import server
+
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+
+    def boom(cfg, **kw):
+        raise RuntimeError("kaboom-xyz")
+
+    monkeypatch.setattr(server, attr, boom)
+    try:
+        assert main([cmd]) == 1
+    finally:
+        _drop_memwatch_handlers()
+    text = (tmp_path / "memwatch" / "logger.log").read_text(encoding="utf-8")
+    assert "kaboom-xyz" in text and "Traceback" in text
+
+
+def test_log_failure_is_logged(tmp_path, monkeypatch):
+    from memwatch import logger
+
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    monkeypatch.setattr(logger, "acquire_single_instance",
+                        lambda: (_ for _ in ()).throw(RuntimeError("mutex-boom")))
+    try:
+        assert main(["log"]) == 1
+    finally:
+        _drop_memwatch_handlers()
+    assert "mutex-boom" in (tmp_path / "memwatch" / "logger.log").read_text(encoding="utf-8")
+
+
+def test_install_shortcut_failure_returns_1(tmp_path, test_root, monkeypatch, capsys):
+    monkeypatch.setattr(cli, "start_logger_detached", lambda: pytest.fail("started"))
+    monkeypatch.setattr(cli, "pythonw_path", lambda: Path(r"C:\Scripts\pythonw.exe"))
+    import win32com.client
+
+    monkeypatch.setattr(win32com.client, "Dispatch",
+                        lambda n: (_ for _ in ()).throw(OSError("no shell")))
+    assert main(["install", "--root", test_root, "--desktop", str(tmp_path)]) == 1
+    assert "shortcut failed" in capsys.readouterr().err
+
+
+def test_purge_reports_leftover_files(tmp_path, test_root, monkeypatch, capsys):
+    import shutil
+
+    local = tmp_path / "local"
+    (local / "memwatch").mkdir(parents=True)
+    (local / "memwatch" / "memwatch.db").write_bytes(b"x")
+    monkeypatch.setenv("LOCALAPPDATA", str(local))
+    monkeypatch.setattr(cli, "find_loggers", lambda: [])
+    monkeypatch.setattr(shutil, "rmtree", lambda *a, **k: None)
+    assert main(["uninstall", "--purge", "--root", test_root,
+                 "--desktop", str(tmp_path)]) == 1
+    assert "memwatch.db" in capsys.readouterr().err
+
+
+def test_wait_gone_kills_survivors(monkeypatch):
+    killed = []
+
+    class P:
+        def kill(self):
+            killed.append(1)
+
+    p = P()
+    monkeypatch.setattr(cli.psutil, "wait_procs", lambda ps, timeout: ([], [p]))
+    cli._wait_gone([p])
+    assert killed == [1]
+
+
+def test_start_logger_detached_closes_handles(monkeypatch):
+    closed = []
+    calls = []
+    monkeypatch.setattr(cli.win32process, "CreateProcess",
+                        lambda *a: calls.append(a) or (11, 22, 1, 2))
+    monkeypatch.setattr(cli.win32api, "CloseHandle", closed.append)
+    cli.start_logger_detached()
+    assert closed == [11, 22]
+    assert calls[0][1].endswith('pythonw.exe" -m memwatch log')
+    flags = calls[0][5]
+    assert flags & cli.win32process.DETACHED_PROCESS

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import shutil
 import sqlite3
 import subprocess
@@ -10,6 +11,8 @@ import winreg
 from pathlib import Path
 
 import psutil
+import win32api
+import win32process
 
 from memwatch import db
 from memwatch.config import load_config
@@ -61,16 +64,25 @@ def find_loggers() -> list[psutil.Process]:
 
 
 def start_logger_detached() -> None:
-    subprocess.Popen(
-        [str(pythonw_path()), "-m", "memwatch", "log"],
-        creationflags=_DETACHED_PROCESS | _CREATE_NEW_PROCESS_GROUP,
-        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        close_fds=True,
-    )
+    pyw = str(pythonw_path())
+    hp, ht, _pid, _tid = win32process.CreateProcess(
+        None, f'"{pyw}" -m memwatch log', None, None, False,
+        win32process.DETACHED_PROCESS | win32process.CREATE_NO_WINDOW
+        | win32process.CREATE_NEW_PROCESS_GROUP,
+        None, None, win32process.STARTUPINFO())
+    win32api.CloseHandle(hp)
+    win32api.CloseHandle(ht)
 
 
 def _wait_gone(procs: list[psutil.Process]) -> None:
-    psutil.wait_procs(procs, timeout=5)
+    _gone, alive = psutil.wait_procs(procs, timeout=5)
+    for p in alive:
+        try:
+            p.kill()
+        except psutil.Error:
+            pass
+    if alive:
+        psutil.wait_procs(alive, timeout=5)
 
 
 def _cmd_log(args) -> int:
@@ -103,15 +115,22 @@ def _cmd_install(args) -> int:
     with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, _run_key(args.root), 0,
                             winreg.KEY_SET_VALUE) as k:
         winreg.SetValueEx(k, RUN_NAME, 0, winreg.REG_SZ, f'"{pyw}" -m memwatch log')
-    desktop = Path(args.desktop) if args.desktop else _desktop_dir()
-    desktop.mkdir(parents=True, exist_ok=True)
-    lnk = win32com.client.Dispatch("WScript.Shell").CreateShortCut(
-        str(desktop / SHORTCUT_NAME))
-    lnk.TargetPath = str(pyw)
-    lnk.Arguments = "-m memwatch report"
-    lnk.WorkingDirectory = str(pyw.parent)
-    lnk.Description = "memwatch memory report"
-    lnk.save()
+    try:
+        desktop = Path(args.desktop) if args.desktop else _desktop_dir()
+        desktop.mkdir(parents=True, exist_ok=True)
+        lnk = win32com.client.Dispatch("WScript.Shell").CreateShortCut(
+            str(desktop / SHORTCUT_NAME))
+        lnk.TargetPath = str(pyw)
+        lnk.Arguments = "-m memwatch report"
+        lnk.WorkingDirectory = str(pyw.parent)
+        lnk.Description = "memwatch memory report"
+        lnk.save()
+    except Exception as e:
+        print(f"memwatch: startup entry was written but the desktop shortcut failed: {e}",
+              file=sys.stderr)
+        print("Run `python -m memwatch uninstall` to undo, or create the shortcut by hand.",
+              file=sys.stderr)
+        return 1
     start_logger_detached()
     print("memwatch installed: logger starts at login; shortcut 'Memory Report' created.")
     return 0
@@ -137,7 +156,13 @@ def _cmd_uninstall(args) -> int:
             pass
     _wait_gone(procs)
     if args.purge:
-        shutil.rmtree(load_config().data_dir, ignore_errors=True)
+        data_dir = load_config().data_dir
+        shutil.rmtree(data_dir, ignore_errors=True)
+        left = [str(f) for f in data_dir.rglob("*") if f.is_file()] if data_dir.exists() else []
+        if left:
+            print("memwatch: could not delete these files:", *left, sep=" | ",
+                  file=sys.stderr)
+            return 1
     print("memwatch uninstalled.")
     return 0
 
@@ -185,4 +210,14 @@ def main(argv: list[str] | None = None) -> int:
         p.set_defaults(fn=fn)
     sub.add_parser("status").set_defaults(fn=_cmd_status)
     args = ap.parse_args(argv)
-    return args.fn(args)
+    if args.cmd not in ("log", "report"):
+        return args.fn(args)
+    # Windowless entry points: failures must land in logger.log, not vanish.
+    from memwatch.logger import setup_logging
+
+    try:
+        setup_logging(load_config())
+        return args.fn(args)
+    except Exception:
+        logging.getLogger("memwatch.cli").exception("memwatch %s failed", args.cmd)
+        return 1
