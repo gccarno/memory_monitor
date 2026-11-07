@@ -18,6 +18,19 @@ _static_cache: dict[tuple[int, float], tuple[str | None, list[str] | None, str |
 _static_cache_lock = threading.Lock()
 
 
+def is_terminated(p) -> bool:
+    """True for a process that has exited but is still listed (zero threads, e.g.
+    stuck in termination). Reading its exe/cmdline/cwd costs ~1 s each while
+    psutil retries, and it holds no user memory, so callers skip it. The thread
+    count comes from the cheap system process list."""
+    try:
+        return p.num_threads() == 0
+    except psutil.NoSuchProcess:
+        return True
+    except psutil.Error:
+        return False
+
+
 def _static_fields(p, key):
     with _static_cache_lock:
         cached = _static_cache.get(key)
@@ -45,6 +58,8 @@ def snapshot_processes() -> list[ProcInfo]:
     for p in psutil.process_iter():
         try:
             with p.oneshot():
+                if is_terminated(p):
+                    continue
                 limited = False
                 try:
                     ct = p.create_time()

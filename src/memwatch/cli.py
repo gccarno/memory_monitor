@@ -14,7 +14,7 @@ import psutil
 import win32api
 import win32process
 
-from memwatch import db
+from memwatch import db, probe
 from memwatch.config import load_config
 from memwatch.elevated_runner import is_memwatch_cmdline
 
@@ -57,9 +57,14 @@ def find_loggers() -> list[psutil.Process]:
     import os
 
     out = []
-    for p in psutil.process_iter(["pid", "cmdline"]):
-        if p.info["pid"] != os.getpid() and is_logger_cmdline(p.info["cmdline"]):
-            out.append(p)
+    for p in psutil.process_iter():
+        if p.pid == os.getpid() or probe.is_terminated(p):
+            continue
+        try:
+            if is_logger_cmdline(p.cmdline()):
+                out.append(p)
+        except psutil.Error:
+            pass
     return out
 
 

@@ -46,6 +46,29 @@ def test_root():
     _delete_tree(root)
 
 
+class _IterProc:
+    def __init__(self, pid, cmdline, threads=1):
+        self.pid, self._cmd, self._threads = pid, cmdline, threads
+
+    def num_threads(self):
+        return self._threads
+
+    def cmdline(self):
+        if self._threads == 0:
+            raise AssertionError("cmdline read on a terminated process")
+        return self._cmd
+
+
+def test_find_loggers_skips_terminated_without_reading_cmdline(monkeypatch):
+    import psutil
+
+    logger_cmd = [r"C:\v\pythonw.exe", "-m", "memwatch", "log"]
+    procs = [_IterProc(11, logger_cmd, threads=0), _IterProc(12, logger_cmd),
+             _IterProc(13, ["notepad.exe"])]
+    monkeypatch.setattr(psutil, "process_iter", lambda *a, **k: iter(procs))
+    assert [p.pid for p in cli.find_loggers()] == [12]
+
+
 def test_install_uninstall_roundtrip(tmp_path, test_root, monkeypatch):
     monkeypatch.setattr(cli, "start_logger_detached", lambda: None)
     monkeypatch.setattr(cli, "find_loggers", lambda: [])

@@ -24,14 +24,18 @@ IoCounters = namedtuple("IoCounters", "read_bytes write_bytes")
 
 
 class FakeProc:
-    def __init__(self, pid, vanish=False, denied=False):
+    def __init__(self, pid, vanish=False, denied=False, threads=1):
         self.pid = pid
         self._vanish = vanish
         self._denied = denied
+        self._threads = threads
 
     @contextmanager
     def oneshot(self):
         yield
+
+    def num_threads(self):
+        return self._threads
 
     def _deny(self):
         if self._denied:
@@ -83,6 +87,45 @@ def test_snapshot_survives_vanishing_and_denied(monkeypatch):
     assert healthy.private_bytes == 100 and healthy.working_set == 200
     assert denied.limited and denied.exe is None and denied.io_bytes is None
     assert denied.cmdline is None and denied.cwd is None
+
+
+class TerminatedProc(FakeProc):
+    """Exited but still listed (stuck in termination): reading its PEB is slow."""
+
+    def __init__(self, pid):
+        super().__init__(pid, threads=0)
+
+    def exe(self):
+        raise AssertionError("exe read on a terminated process")
+
+    def cmdline(self):
+        raise AssertionError("cmdline read on a terminated process")
+
+    def cwd(self):
+        raise AssertionError("cwd read on a terminated process")
+
+
+def test_snapshot_skips_terminated_without_slow_reads(monkeypatch):
+    monkeypatch.setattr(psutil, "process_iter",
+                        lambda *a, **k: iter([FakeProc(10), TerminatedProc(11), FakeProc(12)]))
+    assert [p.pid for p in snapshot_processes()] == [10, 12]
+    assert (11, 1011.0) not in probe._static_cache
+
+
+def test_is_terminated():
+    assert probe.is_terminated(TerminatedProc(1))
+    assert not probe.is_terminated(FakeProc(1))
+
+    class Gone(FakeProc):
+        def num_threads(self):
+            raise psutil.NoSuchProcess(self.pid)
+
+    class Denied(FakeProc):
+        def num_threads(self):
+            raise psutil.AccessDenied(self.pid)
+
+    assert probe.is_terminated(Gone(1))
+    assert not probe.is_terminated(Denied(1))
 
 
 def test_static_cache_pruned(monkeypatch):
