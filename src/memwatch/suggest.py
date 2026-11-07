@@ -245,10 +245,15 @@ def build_report(
                     f"Starts with Windows but you used it on only {used_days} of the last "
                     f"{observed_days} days")
         if not rec.has_windows_ever and not instance:
-            desc = (cfg.notes.get(key)
-                    or next((d for d in (service_desc(s) for s in rec.services) if d), "")
-                    or "no description available")
-            add("STANDALONE", f"Background service with no app you use: {desc}")
+            note = cfg.notes.get(key)
+            if rec.services or note:
+                desc = (note
+                        or next((d for d in (service_desc(s) for s in rec.services) if d), "")
+                        or f"{', '.join(rec.services)} (no description available)")
+                add("STANDALONE", f"Background service with no app you use: {desc}")
+            else:  # a tray agent or helper, not a Windows service
+                add("STANDALONE", "Runs in the background with no window you have opened "
+                                  "while memwatch was watching")
         if key in dup:
             cat, labels = dup[key]
             add("DUPLICATE",

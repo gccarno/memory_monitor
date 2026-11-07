@@ -87,7 +87,15 @@ def test_standalone_uses_service_desc_then_fallback(conn, cfg):
     assert s.reasons == ["Background service with no app you use: Does foo things"]
     assert s.caution is None
     s = build_report(conn, cfg, now=300, service_desc=lambda n: "").suggestions[0]
-    assert s.reasons[0].endswith("no description available")
+    assert s.reasons == ["Background service with no app you use: Foo (no description available)"]
+
+
+def test_windowless_app_without_services_is_not_called_a_service(conn, cfg):
+    seed_ticks(conn, "suite:discord", n=5, priv=10 << 20, label="Discord")
+    s = build_report(conn, cfg, now=300, service_desc=lambda n: "unused").suggestions[0]
+    assert s.reasons == ["Runs in the background with no window you have opened "
+                         "while memwatch was watching"]
+    assert s.reason_codes == ["STANDALONE"]
 
 
 def test_service_modes_empty_without_services(conn, cfg):
