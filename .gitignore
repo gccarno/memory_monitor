@@ -4,3 +4,5 @@ __pycache__/
 .superpowers/
 *.egg-info/
 .pytest_cache/
+
+/target/
