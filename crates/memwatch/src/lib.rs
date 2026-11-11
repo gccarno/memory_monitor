@@ -3,6 +3,7 @@ pub mod db;
 pub mod grouping;
 pub mod models;
 pub mod probe;
+pub mod startup;
 pub mod usage;
 
 #[cfg(test)]

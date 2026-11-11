@@ -475,6 +475,20 @@ pub fn seconds_since_input() -> f64 {
 
 // ---- version info -----------------------------------------------------------
 
+/// A `len`-element slice of `T` at `p`, only if it lies entirely inside `data`
+/// (the version-info block that `VerQueryValueW` points into).
+fn slice_within<T>(data: &[u8], p: *mut c_void, len: usize) -> Option<&[T]> {
+    let start = p as usize;
+    let base = data.as_ptr() as usize;
+    let bytes = len.checked_mul(std::mem::size_of::<T>())?;
+    let end = start.checked_add(bytes)?;
+    if start < base || end > base + data.len() || !start.is_multiple_of(std::mem::align_of::<T>()) {
+        return None;
+    }
+    // SAFETY: [start, end) is inside `data`, which outlives the returned slice, and is aligned for T.
+    Some(unsafe { std::slice::from_raw_parts(start as *const T, len) })
+}
+
 /// CompanyName from the exe's version info, or None when unreadable.
 pub fn file_company(path: &str) -> Option<String> {
     let wpath: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
@@ -491,13 +505,15 @@ pub fn file_company(path: &str) -> Option<String> {
         if !VerQueryValueW(data.as_ptr().cast(), PCWSTR(tr.as_ptr()), &mut p, &mut len).as_bool() || len < 4 {
             return None;
         }
-        let pair = std::slice::from_raw_parts(p as *const u16, 2);
+        // len is in bytes for the translation table; we read its first (lang, codepage) pair.
+        let pair: &[u16] = slice_within(&data, p, 2)?;
         let sub = format!("\\StringFileInfo\\{:04x}{:04x}\\CompanyName\0", pair[0], pair[1]);
         let wsub: Vec<u16> = sub.encode_utf16().collect();
         if !VerQueryValueW(data.as_ptr().cast(), PCWSTR(wsub.as_ptr()), &mut p, &mut len).as_bool() || len == 0 {
             return None;
         }
-        let chars = std::slice::from_raw_parts(p as *const u16, len as usize);
+        // len is in characters for string values.
+        let chars: &[u16] = slice_within(&data, p, len as usize)?;
         let end = chars.iter().position(|&c| c == 0).unwrap_or(chars.len());
         let s = String::from_utf16_lossy(&chars[..end]);
         (!s.is_empty()).then_some(s)
