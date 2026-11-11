@@ -244,7 +244,7 @@ fn subkeys(h: &RegKey, path: &str) -> Vec<String> {
     k.enum_keys().filter_map(Result::ok).collect()
 }
 
-fn read_approved(hive_name: &str, kind: &str, name: &str, root: &str) -> Option<Vec<u8>> {
+pub fn read_approved(hive_name: &str, kind: &str, name: &str, root: &str) -> Option<Vec<u8>> {
     let base = approved_path(kind)?;
     let path = if hive_name == "HKCU" { p(root, &base) } else { base };
     let k = hive(hive_name).open_subkey_with_flags(path, KEY_READ).ok()?;

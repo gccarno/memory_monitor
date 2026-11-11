@@ -767,6 +767,37 @@ pub fn scm_dependents(name: &str) -> Result<Vec<String>, String> {
     }
 }
 
+/// A service's start type as an elevated-runner `start` value: auto, delayed-auto, demand
+/// or disabled. None when unreadable or anything else (boot, system), since undo could not
+/// put those back exactly.
+pub fn service_start_mode(name: &str) -> Option<String> {
+    use windows::Win32::System::Services::{SERVICE_CONFIG_DELAYED_AUTO_START_INFO, SERVICE_DELAYED_AUTO_START_INFO};
+    let (_scm, h) = open_service(SERVICE_QUERY_CONFIG)(name)?;
+    unsafe {
+        let mut buf = vec![0u8; 8192];
+        let mut needed = 0u32;
+        let mut r = QueryServiceConfigW(h.0, Some(buf.as_mut_ptr().cast()), buf.len() as u32, &mut needed);
+        if r.is_err() && needed as usize > buf.len() {
+            buf = vec![0u8; needed as usize];
+            r = QueryServiceConfigW(h.0, Some(buf.as_mut_ptr().cast()), buf.len() as u32, &mut needed);
+        }
+        r.ok()?;
+        let code = (*(buf.as_ptr() as *const QUERY_SERVICE_CONFIGW)).dwStartType.0;
+        match code {
+            2 => {
+                let mut info = [0u8; std::mem::size_of::<SERVICE_DELAYED_AUTO_START_INFO>()];
+                let mut n = 0u32;
+                QueryServiceConfig2W(h.0, SERVICE_CONFIG_DELAYED_AUTO_START_INFO, Some(&mut info), &mut n).ok()?;
+                let delayed = (*(info.as_ptr() as *const SERVICE_DELAYED_AUTO_START_INFO)).fDelayedAutostart.as_bool();
+                Some(if delayed { "delayed-auto" } else { "auto" }.to_string())
+            }
+            3 => Some("demand".into()),
+            4 => Some("disabled".into()),
+            _ => None,
+        }
+    }
+}
+
 /// Whether a service is running; None when that cannot be read.
 pub fn service_is_running(name: &str) -> Option<bool> {
     let (_scm, h) = open_service(SERVICE_QUERY_STATUS)(name)?;

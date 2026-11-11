@@ -1,6 +1,13 @@
 [package]
 name = "test-fixtures"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
+publish = false
 
-[dependencies]
+# Tiny processes the memwatch action tests start and stop (replacing tests/fixtures/*.py).
+
+[dependencies.windows]
+version = "0.58"
+features = [
+  "Win32_Foundation", "Win32_Graphics_Gdi", "Win32_System_LibraryLoader", "Win32_UI_WindowsAndMessaging",
+]

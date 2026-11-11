@@ -524,7 +524,7 @@ pub fn serve_report(cfg: Config, open_browser: bool) -> std::io::Result<()> {
         cfg,
         Box::new(move || crate::db::connect(&path)),
         token.clone(),
-        Box::new(NoActions),
+        Box::new(crate::actions::RealActions::new()),
         Box::new(group_for_key),
         Box::new(exclude_keys),
     )?;

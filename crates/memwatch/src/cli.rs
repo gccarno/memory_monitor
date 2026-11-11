@@ -10,6 +10,8 @@ pub fn main(args: Vec<String>) -> i32 {
     match args.first().map(String::as_str) {
         Some("log") => cmd_log(&args[1..]),
         Some("report") => cmd_report(&args[1..]),
+        // started through UAC; runs only whitelisted, validated ops
+        Some("elevated-run") => crate::elevated_runner::main(&args[1..]),
         _ => {
             eprintln!("usage: memwatch log [--data-dir PATH] | report [--no-browser]");
             2

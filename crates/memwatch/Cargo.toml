@@ -15,6 +15,7 @@ winreg = "0.52"
 csv = "1"
 tiny_http = "0.12"
 getrandom = "0.2"
+base64 = "0.22"
 
 [dependencies.windows]
 version = "0.58"
@@ -22,7 +23,7 @@ features = [
   "Win32_Foundation", "Win32_Graphics_Dwm", "Win32_Storage_FileSystem",
   "Win32_System_Diagnostics_Debug", "Win32_System_ProcessStatus", "Win32_System_Services",
   "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_UI_Input_KeyboardAndMouse",
-  "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_Security", "Win32_System_Com",
+  "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_Security", "Win32_System_Com", "Win32_System_Registry",
 ]
 
 [dev-dependencies]
