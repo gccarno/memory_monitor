@@ -93,7 +93,8 @@ fn task_name_ok(v: Option<&Value>) -> bool {
     if !s.starts_with('\\') || s.contains('"') || s.contains('/') || s.contains("\\\\") {
         return false;
     }
-    if s.split('\\').any(|part| part == "..") {
+    // canonical components only: no empty, ".", "..", or names Windows would trim
+    if s.split('\\').skip(1).any(|c| c.is_empty() || c == "." || c == ".." || c.ends_with([' ', '.']) || c.starts_with(' ')) {
         return false;
     }
     !s.to_lowercase().starts_with("\\microsoft\\windows\\") // Windows' own tasks
@@ -401,6 +402,10 @@ mod tests {
             json!({"op": "set_task", "name": "\\\\Microsoft\\Windows\\X", "enabled": false}),
             json!({"op": "set_task", "name": "\\Vendor\\..\\Microsoft\\Windows\\X", "enabled": false}),
             json!({"op": "set_task", "name": "/Microsoft/Windows/X", "enabled": false}),
+            json!({"op": "set_task", "name": r"\Vendor\.\Microsoft\Windows\X", "enabled": false}),
+            json!({"op": "set_task", "name": r"\Microsoft \Windows\X", "enabled": false}),
+            json!({"op": "set_task", "name": r"\Microsoft\Windows.\X", "enabled": false}),
+            json!({"op": "set_task", "name": r"\Foo\", "enabled": false}),
         ]
     }
 

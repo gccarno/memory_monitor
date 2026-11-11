@@ -303,7 +303,11 @@ impl RealActions {
         }
 
         // Windowless processes: terminate; access-denied ones go to the elevator.
-        let mut ops: Vec<Value> = self.terminate_all(&windowless).iter().map(kill_op).collect();
+        let denied = self.terminate_all(&windowless);
+        // let the ones that were terminated finish exiting, so what changed is judged correctly
+        let ended: Vec<Pid> = windowless.iter().filter(|p| !denied.iter().any(|d| d.pid == p.pid)).map(key).collect();
+        winctl::wait_gone(&ended, FORCE_GRACE);
+        let mut ops: Vec<Value> = denied.iter().map(kill_op).collect();
 
         // Services: only those without running dependents.
         let mut skipped = false;

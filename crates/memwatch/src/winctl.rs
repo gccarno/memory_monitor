@@ -10,7 +10,7 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::System::Services::{
     ChangeServiceConfig2W, ChangeServiceConfigW, CloseServiceHandle, ControlService, OpenSCManagerW, OpenServiceW,
-    QueryServiceStatus, ENUM_SERVICE_TYPE, SC_HANDLE, SC_MANAGER_CONNECT, SERVICE_AUTO_START, SERVICE_CHANGE_CONFIG,
+    QueryServiceConfigW, QueryServiceStatus, ENUM_SERVICE_TYPE, QUERY_SERVICE_CONFIGW, SERVICE_QUERY_CONFIG, SC_HANDLE, SC_MANAGER_CONNECT, SERVICE_AUTO_START, SERVICE_CHANGE_CONFIG,
     SERVICE_CONFIG_DELAYED_AUTO_START_INFO, SERVICE_CONTROL_STOP, SERVICE_DELAYED_AUTO_START_INFO,
     SERVICE_DEMAND_START, SERVICE_DISABLED, SERVICE_ERROR, SERVICE_QUERY_STATUS, SERVICE_START_TYPE, SERVICE_STATUS,
     SERVICE_STOP, SERVICE_STOPPED,
@@ -97,9 +97,33 @@ fn open_service(name: &str, access: u32) -> Result<(Sc, Sc), String> {
     }
 }
 
+/// Only ordinary Win32 services that start at auto, demand or disabled may be changed:
+/// never kernel or file-system drivers, nor boot/system-start services.
+fn ensure_ordinary(h: &Sc) -> Result<(), String> {
+    unsafe {
+        let mut buf = vec![0u8; 8192];
+        let mut needed = 0u32;
+        let mut r = QueryServiceConfigW(h.0, Some(buf.as_mut_ptr().cast()), buf.len() as u32, &mut needed);
+        if r.is_err() && needed as usize > buf.len() {
+            buf = vec![0u8; needed as usize];
+            r = QueryServiceConfigW(h.0, Some(buf.as_mut_ptr().cast()), buf.len() as u32, &mut needed);
+        }
+        r.map_err(|e| e.message())?;
+        let q = &*(buf.as_ptr() as *const QUERY_SERVICE_CONFIGW);
+        if q.dwServiceType.0 & 0x30 == 0 {
+            return Err("not a Win32 service (driver); left alone".into());
+        }
+        if q.dwStartType.0 < 2 {
+            return Err("boot/system-start service; left alone".into());
+        }
+        Ok(())
+    }
+}
+
 /// Stop a service and wait until it reports stopped, for at most `wait`.
 pub fn stop_service(name: &str, wait: Duration) -> Result<(), String> {
-    let (_scm, h) = open_service(name, SERVICE_STOP | SERVICE_QUERY_STATUS)?;
+    let (_scm, h) = open_service(name, SERVICE_STOP | SERVICE_QUERY_STATUS | SERVICE_QUERY_CONFIG)?;
+    ensure_ordinary(&h)?;
     unsafe {
         let mut st = SERVICE_STATUS::default();
         if let Err(e) = ControlService(h.0, SERVICE_CONTROL_STOP, &mut st) {
@@ -129,7 +153,8 @@ pub fn set_service_start(name: &str, start: &str) -> Result<(), String> {
         "disabled" => SERVICE_DISABLED,
         other => return Err(format!("unknown start type {other}")),
     };
-    let (_scm, h) = open_service(name, SERVICE_CHANGE_CONFIG)?;
+    let (_scm, h) = open_service(name, SERVICE_CHANGE_CONFIG | SERVICE_QUERY_CONFIG)?;
+    ensure_ordinary(&h)?;
     unsafe {
         ChangeServiceConfigW(
             h.0,
