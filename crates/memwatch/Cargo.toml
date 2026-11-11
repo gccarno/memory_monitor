@@ -13,6 +13,8 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 log = { version = "0.4", features = ["std"] }
 winreg = "0.52"
 csv = "1"
+tiny_http = "0.12"
+getrandom = "0.2"
 
 [dependencies.windows]
 version = "0.58"

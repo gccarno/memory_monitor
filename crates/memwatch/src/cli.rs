@@ -9,9 +9,29 @@ use crate::logger::{acquire_single_instance, install_global_log, mutex_name, Log
 pub fn main(args: Vec<String>) -> i32 {
     match args.first().map(String::as_str) {
         Some("log") => cmd_log(&args[1..]),
+        Some("report") => cmd_report(&args[1..]),
         _ => {
-            eprintln!("usage: memwatch log [--data-dir PATH]");
+            eprintln!("usage: memwatch log [--data-dir PATH] | report [--no-browser]");
             2
+        }
+    }
+}
+
+/// Open the on-demand report. `--no-browser` prints the URL instead of opening it.
+fn cmd_report(args: &[String]) -> i32 {
+    let open = match args {
+        [] => true,
+        [a] if a == "--no-browser" => false,
+        _ => return 2,
+    };
+    let cfg = load_config(None);
+    let sink = LogSink::open(&cfg.data_dir);
+    install_global_log(sink.clone());
+    match crate::server::serve_report(cfg, open) {
+        Ok(()) => 0,
+        Err(e) => {
+            sink.write("ERROR", "memwatch.cli", &format!("memwatch report failed: {e}"));
+            1
         }
     }
 }
