@@ -288,12 +288,47 @@ fn run_ops_with(
         .collect()
 }
 
+/// The only result path the runner will write: `elev-<32 hex>-out.json`, as `elevate` makes it.
+fn out_name_ok(p: &std::path::Path) -> bool {
+    p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+        n.strip_prefix("elev-")
+            .and_then(|r| r.strip_suffix("-out.json"))
+            .is_some_and(|h| h.len() == 32 && h.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
+    })
+}
+
+/// Write the results without following links: this process is elevated and the folder is
+/// user-writable. The name must match, the parent must not be a reparse point, and the file
+/// is created new (an existing file or link there makes it fail) without following reparse points.
+fn write_results(out: &str, data: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    const REPARSE: u32 = 0x400; // FILE_ATTRIBUTE_REPARSE_POINT
+    const OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    let path = std::path::Path::new(out);
+    let bad = |m: &str| std::io::Error::new(std::io::ErrorKind::InvalidInput, m.to_string());
+    if !out_name_ok(path) {
+        return Err(bad("unexpected result file name"));
+    }
+    let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).ok_or_else(|| bad("no directory"))?;
+    if std::fs::symlink_metadata(parent)?.file_attributes() & REPARSE != 0 {
+        return Err(bad("result directory is a link"));
+    }
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .share_mode(0)
+        .custom_flags(OPEN_REPARSE_POINT)
+        .open(path)?;
+    f.write_all(data)
+}
+
 /// `elevated-run <ops_b64> <out.json>`; returns the process exit code.
 pub fn main(args: &[String]) -> i32 {
     let [arg, out] = args else { return 2 };
     let Some(ops) = decode_ops(arg) else { return 2 };
     let results = run_ops(&ops, BUDGET_S);
-    match std::fs::write(out, serde_json::to_vec(&results).unwrap_or_default()) {
+    match write_results(out, &serde_json::to_vec(&results).unwrap_or_default()) {
         Ok(()) => 0,
         Err(_) => 1,
     }
@@ -452,17 +487,23 @@ mod tests {
     #[test]
     fn main_writes_results_and_refuses_bad_input() {
         let dir = tempfile::tempdir().unwrap();
-        let out = dir.path().join("out.json");
+        let out = dir.path().join(format!("elev-{}-out.json", "a".repeat(32)));
         let arg = encode_ops(&[json!({"op": "nope"}), json!({"op": "kill", "pid": 1, "create_time": 0, "x": 1})]);
         assert_eq!(main(&[arg, out.to_string_lossy().into()]), 0);
         let got: Vec<Value> = serde_json::from_slice(&std::fs::read(&out).unwrap()).unwrap();
         assert_eq!(got, vec![rejected(); 2]);
-        let out2 = dir.path().join("none.json");
+        let out2 = dir.path().join(format!("elev-{}-out.json", "b".repeat(32)));
         for bad in ["", "!!not base64!!"] {
             assert_ne!(main(&[bad.into(), out2.to_string_lossy().into()]), 0);
         }
         assert_ne!(main(&[]), 0);
         assert!(!out2.exists());
+        // wrong name, and an existing file (or link) at the path, are refused
+        let good = encode_ops(&[json!({"op": "nope"})]);
+        let odd = dir.path().join("out.json");
+        assert_eq!(main(&[good.clone(), odd.to_string_lossy().into()]), 1);
+        assert!(!odd.exists());
+        assert_eq!(main(&[good, out.to_string_lossy().into()]), 1, "must not overwrite");
     }
 
     #[test]
