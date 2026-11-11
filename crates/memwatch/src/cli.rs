@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 
 use crate::config::{load_config, Config};
+use crate::install;
 use crate::logger::{acquire_single_instance, install_global_log, mutex_name, Logger, LogSink, RealEnv};
 
 /// Run the CLI; returns the process exit code.
@@ -10,10 +11,18 @@ pub fn main(args: Vec<String>) -> i32 {
     match args.first().map(String::as_str) {
         Some("log") => cmd_log(&args[1..]),
         Some("report") => cmd_report(&args[1..]),
+        Some("install") => cmd_install(&args[1..], false),
+        Some("uninstall") => cmd_install(&args[1..], true),
+        Some("status") if args.len() == 1 => {
+            let cfg = load_config(None);
+            install::status(&cfg, &install::Sys::real(), &mut std::io::stdout())
+        }
         // started through UAC; runs only whitelisted, validated ops
         Some("elevated-run") => crate::elevated_runner::main(&args[1..]),
         _ => {
-            eprintln!("usage: memwatch log [--data-dir PATH] | report [--no-browser]");
+            eprintln!(
+                "usage: memwatch log | report [--no-browser] | install | uninstall [--purge] [--force] | status"
+            );
             2
         }
     }
@@ -65,4 +74,38 @@ fn cmd_log(args: &[String]) -> i32 {
     };
     Logger::new(cfg, conn, Box::new(RealEnv)).run_forever();
     0
+}
+
+/// `install` / `uninstall`, with the hidden `--root`, `--desktop` and `--install-dir`
+/// test hooks.
+fn cmd_install(args: &[String], uninstall: bool) -> i32 {
+    let mut o = install::Opts {
+        src_dir: std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(PathBuf::from))
+            .unwrap_or_default(),
+        ..Default::default()
+    };
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match (a.as_str(), uninstall) {
+            ("--root", _) => o.root = it.next().cloned(),
+            ("--desktop", _) => o.desktop = it.next().map(PathBuf::from),
+            ("--install-dir", _) => o.install_dir = it.next().map(PathBuf::from),
+            ("--purge", true) => o.purge = true,
+            ("--force", true) => o.force = true,
+            _ => {
+                eprintln!("memwatch: unexpected argument {a}");
+                return 2;
+            }
+        }
+    }
+    let cfg = load_config(None);
+    let (mut out, mut err) = (std::io::stdout(), std::io::stderr());
+    let sys = install::Sys::real();
+    if uninstall {
+        install::uninstall(&cfg, &o, &sys, &mut out, &mut err)
+    } else {
+        install::install(&cfg, &o, &sys, &mut out, &mut err)
+    }
 }

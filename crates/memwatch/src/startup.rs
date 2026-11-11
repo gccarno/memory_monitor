@@ -299,7 +299,7 @@ fn run_entries(cfg: &Config, root: &str) -> Vec<StartupEntry> {
     out
 }
 
-fn lnk_target(path: &str) -> String {
+pub(crate) fn lnk_target(path: &str) -> String {
     use windows::core::{Interface, PCWSTR};
     use windows::Win32::Storage::FileSystem::WIN32_FIND_DATAW;
     use windows::Win32::System::Com::{

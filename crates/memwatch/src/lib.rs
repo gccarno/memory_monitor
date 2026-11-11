@@ -5,6 +5,7 @@ pub mod db;
 pub mod elevate;
 pub mod elevated_runner;
 pub mod grouping;
+pub mod install;
 pub mod logger;
 pub mod models;
 pub mod probe;
