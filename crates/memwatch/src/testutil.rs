@@ -65,3 +65,38 @@ pub fn mk_sys(ts: i64) -> SystemSnapshot {
         logger_ws: None,
     }
 }
+
+pub fn mk_cfg() -> crate::config::Config {
+    crate::config::load_config(Some(std::path::Path::new("nonexistent.toml")))
+}
+
+/// One tick for one group; `edit` adjusts the group (kind, label, services...).
+pub fn tick_with(
+    conn: &Connection,
+    ts: i64,
+    key: &str,
+    fg: bool,
+    priv_: i64,
+    windows: bool,
+    edit: &dyn Fn(&mut AppGroup),
+) {
+    let mut g = mk_group(key, priv_);
+    edit(&mut g);
+    let flags = crate::models::UsageFlags { foreground: fg, active: fg, has_windows: windows };
+    crate::db::write_tick(conn, &mk_sys(ts), &[(g, flags)], &[]).unwrap();
+}
+
+pub fn tick(conn: &Connection, ts: i64, key: &str, fg: bool, priv_: i64, windows: bool) {
+    tick_with(conn, ts, key, fg, priv_, windows, &|_| {});
+}
+
+/// `n` ticks, 60 s apart from time zero; never foreground.
+pub fn seed_with(conn: &Connection, key: &str, n: i64, priv_: i64, edit: &dyn Fn(&mut AppGroup)) {
+    for i in 0..n {
+        tick_with(conn, i * 60, key, false, priv_, false, edit);
+    }
+}
+
+pub fn seed(conn: &Connection, key: &str, n: i64, priv_: i64) {
+    seed_with(conn, key, n, priv_, &|_| {});
+}

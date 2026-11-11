@@ -18,7 +18,9 @@ use windows::Win32::System::ProcessStatus::{
     GetPerformanceInfo, GetProcessMemoryInfo, PERFORMANCE_INFORMATION, PROCESS_MEMORY_COUNTERS,
 };
 use windows::Win32::System::Services::{
-    CloseServiceHandle, EnumServicesStatusExW, OpenSCManagerW, OpenServiceW, QueryServiceConfig2W,
+    CloseServiceHandle, EnumDependentServicesW, EnumServicesStatusExW, QueryServiceStatus,
+    ENUM_SERVICE_STATUSW, SERVICE_ACTIVE, SERVICE_ENUMERATE_DEPENDENTS, SERVICE_QUERY_STATUS,
+    SERVICE_RUNNING, SERVICE_STATUS, OpenSCManagerW, OpenServiceW, QueryServiceConfig2W,
     QueryServiceConfigW, ENUM_SERVICE_STATUS_PROCESSW, QUERY_SERVICE_CONFIGW, SC_ENUM_PROCESS_INFO,
     SC_HANDLE, SC_MANAGER_CONNECT, SC_MANAGER_ENUMERATE_SERVICE, SERVICE_CONFIG_DESCRIPTION,
     SERVICE_DESCRIPTIONW, SERVICE_QUERY_CONFIG, SERVICE_STATE_ALL, SERVICE_WIN32,
@@ -708,6 +710,69 @@ pub fn services_by_pid() -> HashMap<u32, Vec<ServiceInfo>> {
         }
     }
     by_pid
+}
+
+fn open_service(access: u32) -> impl Fn(&str) -> Option<(ScHandle, ScHandle)> {
+    move |name: &str| unsafe {
+        let scm = ScHandle(OpenSCManagerW(None, None, SC_MANAGER_CONNECT).ok()?);
+        let w: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+        let h = ScHandle(OpenServiceW(scm.0, PCWSTR(w.as_ptr()), access).ok()?);
+        Some((scm, h))
+    }
+}
+
+/// A service's description text; empty when it has none or cannot be read. Never fails.
+pub fn service_description(name: &str) -> String {
+    let Some((_scm, h)) = open_service(SERVICE_QUERY_CONFIG)(name) else { return String::new() };
+    unsafe {
+        let mut dbuf = vec![0u8; 8192];
+        let mut needed = 0u32;
+        let mut d = QueryServiceConfig2W(h.0, SERVICE_CONFIG_DESCRIPTION, Some(&mut dbuf), &mut needed);
+        if d.is_err() && needed as usize > dbuf.len() {
+            dbuf = vec![0u8; needed as usize];
+            d = QueryServiceConfig2W(h.0, SERVICE_CONFIG_DESCRIPTION, Some(&mut dbuf), &mut needed);
+        }
+        if d.is_ok() {
+            wstr((*(dbuf.as_ptr() as *const SERVICE_DESCRIPTIONW)).lpDescription)
+        } else {
+            String::new()
+        }
+    }
+}
+
+/// Running services that depend on `name`, straight from the service manager.
+pub fn scm_dependents(name: &str) -> Result<Vec<String>, String> {
+    let (_scm, h) = open_service(SERVICE_ENUMERATE_DEPENDENTS)(name)
+        .ok_or_else(|| "cannot open service".to_string())?;
+    unsafe {
+        let mut buf = vec![0u8; 16 << 10];
+        loop {
+            let (mut needed, mut count) = (0u32, 0u32);
+            let r = EnumDependentServicesW(
+                h.0, SERVICE_ACTIVE, Some(buf.as_mut_ptr().cast()), buf.len() as u32,
+                &mut needed, &mut count,
+            );
+            match r {
+                Ok(()) => {
+                    let items = std::slice::from_raw_parts(
+                        buf.as_ptr() as *const ENUM_SERVICE_STATUSW, count as usize);
+                    return Ok(items.iter().map(|e| wstr(e.lpServiceName)).collect());
+                }
+                Err(e) if e.code() == ERROR_MORE_DATA.to_hresult() && needed as usize > buf.len() => {
+                    buf = vec![0u8; needed as usize];
+                }
+                Err(e) => return Err(e.to_string()),
+            }
+        }
+    }
+}
+
+/// Whether a service is running; None when that cannot be read.
+pub fn service_is_running(name: &str) -> Option<bool> {
+    let (_scm, h) = open_service(SERVICE_QUERY_STATUS)(name)?;
+    let mut st = SERVICE_STATUS::default();
+    unsafe { QueryServiceStatus(h.0, &mut st).ok()? };
+    Some(st.dwCurrentState == SERVICE_RUNNING)
 }
 
 #[cfg(test)]
