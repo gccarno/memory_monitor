@@ -291,12 +291,78 @@ fn cwd_of(pid: u32) -> Option<String> {
     Some(s)
 }
 
+const SYSTEM_PROCESS_ID_INFORMATION: u32 = 88;
+
+/// (NT device path, drive letter) pairs, e.g. (`\Device\HarddiskVolume3`, `C:`).
+fn dos_devices() -> Vec<(String, String)> {
+    use windows::Win32::Storage::FileSystem::QueryDosDeviceW;
+    let mut out = Vec::new();
+    for letter in 'A'..='Z' {
+        let drive = format!("{letter}:");
+        let w: Vec<u16> = drive.encode_utf16().chain(std::iter::once(0)).collect();
+        let mut buf = [0u16; 1024];
+        let n = unsafe { QueryDosDeviceW(PCWSTR(w.as_ptr()), Some(&mut buf)) } as usize;
+        if n > 0 {
+            let end = buf.iter().position(|&c| c == 0).unwrap_or(n);
+            out.push((String::from_utf16_lossy(&buf[..end]), drive));
+        }
+    }
+    out
+}
+
+static DOS_DEVICES: LazyLock<Mutex<Vec<(String, String)>>> = LazyLock::new(|| Mutex::new(dos_devices()));
+
+fn nt_to_dos(nt: &str, devices: &[(String, String)]) -> Option<String> {
+    devices.iter().find_map(|(dev, drive)| {
+        let rest = nt.strip_prefix(dev.as_str())?;
+        (rest.starts_with('\\') || rest.is_empty()).then(|| format!("{drive}{rest}"))
+    })
+}
+
+/// Image path without opening the process (works for protected and elevated ones),
+/// like psutil's fallback: `SystemProcessIdInformation` returns an NT path.
+fn exe_via_system_info(pid: u32) -> Option<String> {
+    let mut cap = 1024usize; // bytes for the name
+    for _ in 0..3 {
+        let mut name = vec![0u8; cap];
+        let mut info = [0u8; 24]; // pid (8) + UNICODE_STRING { len u16, max u16, pad u32, buffer ptr }
+        info[0..8].copy_from_slice(&(pid as u64).to_le_bytes());
+        info[10..12].copy_from_slice(&(cap as u16).to_le_bytes());
+        info[16..24].copy_from_slice(&(name.as_mut_ptr() as u64).to_le_bytes());
+        let mut ret = 0u32;
+        let st = unsafe {
+            NtQuerySystemInformation(SYSTEM_PROCESS_ID_INFORMATION, info.as_mut_ptr().cast(), 24, &mut ret)
+        };
+        if st == STATUS_INFO_LENGTH_MISMATCH {
+            let need = rd_u16(&info, 10) as usize;
+            if need <= cap || need > 60_000 {
+                return None;
+            }
+            cap = need;
+            continue;
+        }
+        if st < 0 {
+            return None;
+        }
+        let len = rd_u16(&info, 8) as usize;
+        if len == 0 || len > cap {
+            return None;
+        }
+        let nt = utf16le(&name[..len]);
+        let mut devices = DOS_DEVICES.lock().unwrap();
+        if let Some(p) = nt_to_dos(&nt, &devices) {
+            return Some(p);
+        }
+        *devices = dos_devices(); // a volume may have been mounted since the first lookup
+        return nt_to_dos(&nt, &devices);
+    }
+    None
+}
+
 fn read_static(r: &RawProc) -> StaticFields {
-    let Some(h) = open(r.pid, PROCESS_QUERY_LIMITED_INFORMATION) else {
-        return StaticFields { limited: true, ..Default::default() };
-    };
-    let exe = exe_of(&h);
-    let cmdline = cmdline_of(&h);
+    let h = open(r.pid, PROCESS_QUERY_LIMITED_INFORMATION);
+    let exe = h.as_ref().and_then(exe_of).or_else(|| exe_via_system_info(r.pid));
+    let cmdline = h.as_ref().and_then(cmdline_of);
     let limited = exe.is_none() || cmdline.is_none();
     drop(h);
     let cwd = if cmdline.is_some() { cwd_of(r.pid) } else { None };
@@ -763,6 +829,17 @@ mod tests {
         assert!(svcs.iter().any(|s| s.start_type == "automatic"));
         let by_pid = services_by_pid();
         assert!(by_pid.iter().all(|(pid, l)| *pid > 0 && !l.is_empty()));
+    }
+
+    #[test]
+    fn exe_without_a_handle_resolves_to_a_dos_path() {
+        // this process's own image, found through the no-handle path
+        let exe = exe_via_system_info(std::process::id()).expect("image name");
+        assert!(exe.len() > 3 && exe.as_bytes()[1] == b':', "{exe}");
+        assert!(std::path::Path::new(&exe).exists(), "{exe}");
+        let devs = [(r"\Device\HarddiskVolume3".to_string(), "C:".to_string())];
+        assert_eq!(nt_to_dos(r"\Device\HarddiskVolume3\Windows\x.exe", &devs), Some(r"C:\Windows\x.exe".to_string()));
+        assert_eq!(nt_to_dos(r"\Device\HarddiskVolume33\x", &devs), None);
     }
 
     #[test]
