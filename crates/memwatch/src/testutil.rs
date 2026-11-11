@@ -1,6 +1,34 @@
 use crate::db::connect;
-use crate::models::{AppGroup, SystemSnapshot};
+use crate::models::{AppGroup, ProcInfo, ServiceInfo, SystemSnapshot};
 use rusqlite::Connection;
+
+pub fn mkproc(pid: u32, ppid: u32, name: &str, exe: Option<&str>) -> ProcInfo {
+    ProcInfo {
+        pid,
+        ppid,
+        name: name.into(),
+        exe: exe.map(Into::into),
+        cmdline: None,
+        create_time: 1.0,
+        private_bytes: 10 << 20,
+        working_set: 8 << 20,
+        cpu_s: Some(0.0),
+        io_bytes: Some(0),
+        cwd: None,
+        limited: false,
+    }
+}
+
+pub fn svc(name: &str) -> ServiceInfo {
+    ServiceInfo {
+        name: name.into(),
+        display_name: name.into(),
+        description: String::new(),
+        start_type: "manual".into(),
+        pid: None,
+        binpath: String::new(),
+    }
+}
 
 pub fn mem_conn() -> (tempfile::TempDir, Connection) {
     let dir = tempfile::tempdir().unwrap();
